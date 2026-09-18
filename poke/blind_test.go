@@ -1,6 +1,7 @@
 package poke
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -166,5 +167,55 @@ func TestBuildNetworkConfigWithoutAnElection(t *testing.T) {
 	// The current set is the one thing that must be there.
 	if _, err := buildNetworkConfig(nil, previous, nil, nil); err == nil {
 		t.Fatal("a missing current validator set was accepted")
+	}
+}
+
+// TestBlindSinceIsSetOnce is the one property of the blind latch that matters. If a later failure
+// refreshed the timestamp, the two-hour participate window would never expire: the poker would keep
+// lending a treasury it cannot tell is halted, PokerBlindModeExpired would never fire, and nothing
+// else would look wrong.
+func TestBlindSinceIsSetOnce(t *testing.T) {
+	var b blindState
+	start := time.Now()
+
+	if b.Blind() {
+		t.Fatal("a fresh latch started blind")
+	}
+	if entered, left := b.Observe(nil, start); entered || left {
+		t.Fatal("a successful read on a healthy latch reported a transition")
+	}
+
+	entered, _ := b.Observe(errors.New("tuple is the wrong shape"), start)
+	if !entered || !b.Blind() {
+		t.Fatal("a failed read did not enter blind mode")
+	}
+	if !b.Since().Equal(start) {
+		t.Fatalf("blind since %v, want %v", b.Since(), start)
+	}
+
+	// Every subsequent failure, including ones hours later, must leave the clock alone.
+	for _, after := range []time.Duration{time.Minute, time.Hour, 3 * time.Hour} {
+		entered, left := b.Observe(errors.New("still wrong"), start.Add(after))
+		if entered || left {
+			t.Fatalf("a repeat failure after %v reported a transition", after)
+		}
+		if !b.Since().Equal(start) {
+			t.Fatalf("a failure after %v moved the clock to %v; the window would never expire", after, b.Since())
+		}
+	}
+
+	// And a recovery clears it, so the next outage measures its own window rather than inheriting
+	// this one and expiring immediately.
+	if _, left := b.Observe(nil, start.Add(4*time.Hour)); !left {
+		t.Fatal("a successful read did not leave blind mode")
+	}
+	if b.Blind() || !b.Since().IsZero() {
+		t.Fatalf("leaving blind mode left state behind: blind=%v since=%v", b.Blind(), b.Since())
+	}
+
+	later := start.Add(5 * time.Hour)
+	b.Observe(errors.New("again"), later)
+	if !b.Since().Equal(later) {
+		t.Fatalf("a second outage inherited the first one's clock: %v, want %v", b.Since(), later)
 	}
 }

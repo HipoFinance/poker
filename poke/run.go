@@ -24,8 +24,7 @@ type Poker struct {
 	tracker *Tracker
 	dryRun  bool
 
-	blind      bool
-	blindSince time.Time
+	blind blindState
 }
 
 func New(ctx context.Context, o Options) (*Poker, error) {
@@ -101,8 +100,8 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	view := View{
 		Now:        p.clock.Now(),
 		Network:    network,
-		Blind:      p.blind,
-		BlindSince: p.blindSince,
+		Blind:      p.blind.Blind(),
+		BlindSince: p.blind.Since(),
 		Treasury:   treasury,
 	}
 
@@ -112,7 +111,7 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	// Confirmation only means something in precise mode. Blind mode has every op due for every
 	// candidate on every cycle, so nothing ever leaves the due set and an age tracked there would
 	// grow without bound and read as a wedge. PokerBlindMode is the signal for that.
-	if !p.blind {
+	if !p.blind.Blind() {
 		for _, c := range p.tracker.Observe(due, wall) {
 			log.Printf("✅ %v confirmed: the state moved", c)
 			Confirmed.WithLabelValues(c.Op.String()).Inc()
@@ -147,7 +146,7 @@ func (p *Poker) send(ctx context.Context, due []Poke) {
 }
 
 func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration, string) {
-	if p.blind {
+	if p.blind.Blind() {
 		// No deadlines are known and nothing can be confirmed, so there is nothing to burst
 		// towards and nothing to chase. Plain retries until the read comes back.
 		return RetryInterval, "blind"
@@ -165,24 +164,22 @@ func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration
 }
 
 func (p *Poker) setBlind(readErr error) {
-	if readErr != nil {
-		if !p.blind {
-			p.blind = true
-			p.blindSince = time.Now()
-			p.tracker.Reset()
-			log.Printf("🙈 Blind mode: %v", readErr)
-			log.Printf("🙈 Poking every candidate round from the network config. "+
-				"participate_in_election is included for the next %v, then withdrawn.",
-				BlindParticipateWindow)
-		}
-		BlindMode.Set(1)
-		BlindModeSince.Set(float64(p.blindSince.Unix()))
-		return
+	entered, left := p.blind.Observe(readErr, time.Now())
+	if entered {
+		p.tracker.Reset()
+		log.Printf("🙈 Blind mode: %v", readErr)
+		log.Printf("🙈 Poking every candidate round from the network config. "+
+			"participate_in_election is included for the next %v, then withdrawn.",
+			BlindParticipateWindow)
 	}
-	if p.blind {
-		p.blind = false
+	if left {
 		p.tracker.Reset()
 		log.Printf("👁  Treasury state is readable again")
+	}
+	if p.blind.Blind() {
+		BlindMode.Set(1)
+		BlindModeSince.Set(float64(p.blind.Since().Unix()))
+		return
 	}
 	BlindMode.Set(0)
 	BlindModeSince.Set(0)

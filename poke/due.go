@@ -226,3 +226,35 @@ func lessPoke(a, b Poke) bool {
 	}
 	return a.Op < b.Op
 }
+
+// blindState is the blind-mode latch, kept separate from the chain plumbing so that the one
+// property that matters about it can be tested: BlindSince is set ONCE, when blind mode is
+// entered, and is not refreshed by the failures that follow.
+//
+// If it were refreshed, the two-hour participate window would never expire, PokerBlindModeExpired
+// would never fire, and the halt guard would be off indefinitely with nobody told - which is the
+// exact failure the bounded window exists to prevent. Nothing else would look wrong.
+type blindState struct {
+	blind bool
+	since time.Time
+}
+
+// Observe folds in one cycle's read result. It reports whether blind mode was entered or left, so
+// the caller logs the transition rather than every cycle.
+func (b *blindState) Observe(readErr error, now time.Time) (entered, left bool) {
+	switch {
+	case readErr != nil && !b.blind:
+		b.blind = true
+		b.since = now
+		return true, false
+	case readErr == nil && b.blind:
+		b.blind = false
+		b.since = time.Time{}
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func (b *blindState) Blind() bool      { return b.blind }
+func (b *blindState) Since() time.Time { return b.since }
