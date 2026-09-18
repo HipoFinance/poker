@@ -182,3 +182,17 @@ func replace(tuple []any, index int, with any) []any {
 	out[index] = with
 	return out
 }
+
+// A rejected tuple must still report its observed length. That number is what an operator is told
+// to compare against the expected one when PokerBlindMode fires, so it has to survive the
+// rejection that caused the alert.
+func TestParseTreasuryStateReportsLengthEvenWhenRejected(t *testing.T) {
+	short := stateTuple(nil, 0)[:treasuryStateMinFields-3]
+	ts, err := parseTreasuryState(short)
+	if err == nil {
+		t.Fatal("a short tuple was accepted")
+	}
+	if ts.Fields != treasuryStateMinFields-3 {
+		t.Fatalf("observed length %d was lost on rejection, want %d", ts.Fields, treasuryStateMinFields-3)
+	}
+}

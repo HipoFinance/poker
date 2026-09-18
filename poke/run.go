@@ -88,7 +88,11 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	LastReadSuccess.Set(float64(time.Now().Unix()))
 
 	treasury, readErr := session.ReadTreasury(session.Ctx)
-	if readErr == nil {
+	// Published whenever a tuple came back at all, including when it was then rejected - a shape
+	// change is exactly the case where an operator needs to see the observed length, and
+	// PokerBlindMode's runbook entry tells them to compare it against the expected one.
+	// Fields is zero only when the get-method call itself failed.
+	if treasury.Fields > 0 {
 		TreasuryStateFields.Set(float64(treasury.Fields))
 	}
 	p.setBlind(readErr)
