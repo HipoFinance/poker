@@ -55,10 +55,25 @@ participation cell are all checked before anything is believed; a mismatch is a 
 a read failure is **blind mode**, which derives candidate rounds from the network config alone and
 fires everything plausible, parsing nothing the treasury returns.
 
-**It respects a halt.** With `stopped? == true` it withholds `participate_in_election` and keeps
-settling, so a halted pool does not keep lending but in-flight rounds still complete. Blind mode
-cannot see `stopped?`, so it keeps participating for two hours — with an alert from the first
-minute — and then withdraws.
+**It respects a halt without stranding anyone.** `request_loan` checks `stopped?`, so a halted pool
+can gain no new requests — an open round then holds only bids placed before the halt, whose
+collateral is stuck for as long as the round stays open. `distribute` has the way out:
+
+```func
+int elected?  = ~ config_param(config::next_validators).null?();
+int too_late? = now() >= min(participate_until, round_since);
+if elected? | too_late? {
+    ;; reject all requests if already elected or there is not enough time for safe participation
+```
+
+Poked once that branch is guaranteed, `distribute` refunds every request and retires the round
+without lending a single GRAM. So while `stopped?` is set, the poker waits for it rather than
+withholding the message — the borrowers get their collateral back, the round closes, and the halted
+pool lends nothing. Settling is never withheld in any mode.
+
+Blind mode cannot see `stopped?`, so it participates normally for two hours — with an alert — and
+after that only while config 36 exists, which is the half of the refund condition that needs no
+treasury read.
 
 ## Configuration
 

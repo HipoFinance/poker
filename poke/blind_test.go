@@ -219,3 +219,32 @@ func TestBlindSinceIsSetOnce(t *testing.T) {
 		t.Fatalf("a second outage inherited the first one's clock: %v, want %v", b.Since(), later)
 	}
 }
+
+// TestBlindPastTheWindowStillRetiresOpenRounds. When the participate window closes, blind mode
+// stops lending - but it must not stop resolving open rounds, or a round's borrowers keep their
+// collateral locked up until somebody notices the alert.
+//
+// distribute refunds every request whenever the next validator set exists, and config 36 is
+// readable without the treasury, so blind mode can tell when participating is safe even though it
+// cannot tell whether the treasury is halted.
+func TestBlindPastTheWindowStillRetiresOpenRounds(t *testing.T) {
+	wall := time.Now()
+	expired := wall.Add(-BlindParticipateWindow - time.Minute)
+
+	noElection := View{Now: testNow, Network: blindNetwork(), Blind: true, BlindSince: expired}
+	if hasOp(Due(noElection, wall), OpParticipateInElection) {
+		t.Fatal("blind mode lent past its window, with no refund branch to fall into")
+	}
+
+	electing := blindNetwork()
+	electing.NextSince = nextRound
+	duringElection := View{Now: testNow, Network: electing, Blind: true, BlindSince: expired}
+	got := Due(duringElection, wall)
+	if !hasOp(got, OpParticipateInElection) {
+		t.Fatal("blind mode left open rounds stranded even though distribute would only refund them")
+	}
+	// And the settling ops are never withheld, in any mode.
+	if !hasOp(got, OpVsetChanged) || !hasOp(got, OpFinishParticipation) {
+		t.Fatalf("blind mode stopped settling: %v", got)
+	}
+}

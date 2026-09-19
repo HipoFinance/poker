@@ -30,9 +30,13 @@ becomes blind mode — and never a partially trusted value. A getter insert brok
 in 2026-09-06 and cost a round; this service is the thing that is supposed to still work then.
 
 **`participate_in_election` is the only op with a safety question attached.** Settling ops
-(`vset_changed`, `finish_participation`) should run in every mode, always: withholding them
-strands in-flight rounds. Participating lends money, so it is withheld when `stopped?` is set and
-bounded to two hours in blind mode. Do not "simplify" those two branches into one.
+(`vset_changed`, `finish_participation`) run in every mode, always: withholding them strands
+in-flight rounds and neither lends anything. Participating is different, because *what it does
+depends on when it is sent*: inside the election window `distribute` lends, and once
+`elected? | too_late?` holds it refunds every request and retires the round instead. The halt
+policy is built on that distinction, not on withholding — see `participateDue` in `poke/due.go`.
+Do not collapse those branches, and do not "fix" the stopped case by skipping the message: that
+strands the collateral of borrowers who bid before the halt.
 
 **A send is not a confirmation.** An external that fails a guard leaves no transaction and no
 receipt. Anything that reports success on `SendExternalMessage` returning nil is wrong; the

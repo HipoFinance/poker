@@ -145,23 +145,63 @@ func TestParticipateIsNotDueEarly(t *testing.T) {
 	}
 }
 
-// TestStoppedWithholdsParticipateOnly is the halt guard. Settling must keep running or a halted
-// pool would strand every in-flight round; lending must not, or this service would turn a
-// documented hazard into a dependable one during exactly the incident that caused the halt.
-func TestStoppedWithholdsParticipateOnly(t *testing.T) {
-	open := precise(t, nextRound, StateOpen, currentHash, 0, true, testNow-600, testNow)
-	if got := Due(open, time.Now()); len(got) != 0 {
-		t.Fatalf("a stopped treasury was poked to lend: %v", ops(got))
+// TestStoppedDefersParticipateToTheRefundBranch is the halt policy.
+//
+// request_loan checks stopped?, so a halted pool can gain no new requests and an open round holds
+// only bids placed before the halt. Leaving it open strands that collateral; lending it puts the
+// pool's money in the elector for a round and a hold, right after the governor halted it.
+// distribute's `elected? | too_late?` branch is the way out: it refunds every request and retires
+// the round without lending. So while stopped, participate waits for that branch and settling
+// carries on untouched.
+func TestStoppedDefersParticipateToTheRefundBranch(t *testing.T) {
+	// participate_until is participate_since + 600, so the refund branch opens at electionAt+600.
+	const refundAt = electionAt + 600
+
+	inWindow := precise(t, nextRound, StateOpen, currentHash, 0, true, electionAt, electionAt+1)
+	if got := Due(inWindow, time.Now()); len(got) != 0 {
+		t.Fatalf("a halted treasury was poked inside the election window, which lends: %v", ops(got))
 	}
 
-	held := precise(t, prevRound, StateHeld, currentHash, testNow-1, true, testNow-600, testNow)
+	afterWindow := precise(t, nextRound, StateOpen, currentHash, 0, true, electionAt, refundAt)
+	if got := Due(afterWindow, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
+		t.Fatalf("a halted treasury left its open round stranded past participate_until: %v", ops(got))
+	}
+
+	// The other arm of distribute's condition: once the next validator set exists, distribute
+	// refunds whatever it is given, whatever the clock says.
+	elected := precise(t, nextRound, StateOpen, currentHash, 0, true, electionAt, electionAt+1)
+	elected.Network.NextSince = nextRound
+	if got := Due(elected, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
+		t.Fatalf("the elected? arm of the refund branch was not used: %v", ops(got))
+	}
+
+	// A stale open round - one whose own start has passed - is past min(participate_until,
+	// round_since) by definition, so its borrowers get their collateral back immediately.
+	stale := precise(t, prevRound, StateOpen, currentHash, 0, true, electionAt, testNow)
+	if got := Due(stale, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
+		t.Fatalf("a stale open round stayed stranded on a halted treasury: %v", ops(got))
+	}
+}
+
+// Settling must be completely unaffected by a halt, or in-flight rounds never finish and their
+// unstake bills are never paid.
+func TestStoppedStillSettles(t *testing.T) {
+	held := precise(t, prevRound, StateHeld, currentHash, testNow-1, true, electionAt, testNow)
 	if got := Due(held, time.Now()); !sameOps(got, []Op{OpFinishParticipation}) {
 		t.Fatalf("a stopped treasury stopped settling: %v", ops(got))
 	}
 
-	staked := precise(t, currRound, StateStaked, staleHash, 0, true, testNow-600, testNow)
+	staked := precise(t, currRound, StateStaked, staleHash, 0, true, electionAt, testNow)
 	if got := Due(staked, time.Now()); !sameOps(got, []Op{OpVsetChanged}) {
 		t.Fatalf("a stopped treasury stopped observing the validator set: %v", ops(got))
+	}
+}
+
+// An unhalted treasury must still lend at the normal moment, or the pool simply stops earning.
+func TestNotStoppedParticipatesInTheElectionWindow(t *testing.T) {
+	v := precise(t, nextRound, StateOpen, currentHash, 0, false, electionAt, electionAt)
+	if got := Due(v, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
+		t.Fatalf("a healthy treasury did not lend at participate_since: %v", ops(got))
 	}
 }
 
@@ -198,9 +238,11 @@ func TestNextDeadline(t *testing.T) {
 		t.Fatalf("an already-due round produced a future deadline of %v", d)
 	}
 
-	// A stopped treasury is not waiting for an election window it will not act on.
+	// A stopped treasury waits for the refund branch, not the election window, so its deadline
+	// is participate_until rather than participate_since.
 	stopped := precise(t, nextRound, StateOpen, currentHash, 0, true, electionAt, testNow)
-	if d, ok := NextDeadline(stopped); ok {
-		t.Fatalf("a stopped treasury scheduled a lending deadline of %v", d)
+	d, ok := NextDeadline(stopped)
+	if !ok || d != electionAt+600 {
+		t.Fatalf("a halted treasury scheduled %v (ok=%v), want the refund branch at %v", d, ok, electionAt+600)
 	}
 }

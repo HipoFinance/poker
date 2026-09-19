@@ -53,9 +53,11 @@ func Due(v View, wall time.Time) []Poke {
 }
 
 func dueBlind(v View, wall time.Time) []Poke {
-	ops := AllOps
-	if !v.blindAllowsParticipate(wall) {
-		ops = []Op{OpVsetChanged, OpFinishParticipation}
+	// Settling never stops: withholding vset_changed or finish_participation would strand
+	// in-flight rounds, and neither lends anything.
+	ops := []Op{OpVsetChanged, OpFinishParticipation}
+	if v.blindAllowsParticipate(wall) || v.refundOnly() {
+		ops = AllOps
 	}
 	var out []Poke
 	for _, round := range v.Network.Candidates() {
@@ -72,15 +74,7 @@ func duePrecise(v View) []Poke {
 		p := v.Treasury.Participations[round]
 		switch p.State {
 		case StateOpen:
-			// The halt guard. stopped? is read by deposit_coins and request_loan only, so
-			// participate_in_election, distribute and process_loan_requests will happily lend a
-			// halted pool's already-placed requests. That is a documented hazard today and an
-			// unreliable one; a service poking every minute would make it dependable. Settling
-			// keeps running either way, so in-flight rounds always complete.
-			if v.Treasury.Stopped {
-				continue
-			}
-			if v.Now >= participateAt(v.Treasury.Times.ParticipateSince, round) {
+			if v.participateDue(round) {
 				out = append(out, Poke{Op: OpParticipateInElection, RoundSince: round})
 			}
 		case StateStaked, StateValidating:
@@ -98,6 +92,57 @@ func duePrecise(v View) []Poke {
 		}
 	}
 	return out
+}
+
+// participateDue is the treasury's own guard for participate_in_election, plus this service's
+// halt policy.
+//
+// The guard is now() >= min(participate_since, round_since). The policy is about what poking an
+// open round DOES, which is not the same at every moment:
+//
+//   - Poked inside the election window, distribute lends the round's requests to the elector.
+//   - Poked once the election has closed - `elected? | too_late?` in distribute - it moves every
+//     request to `rejected` instead, refunds each borrower's collateral through
+//     process_loan_requests, and retires the round without lending a single GRAM.
+//
+// A halted treasury wants the second and not the first. request_loan checks stopped?, so a halted
+// pool can gain no new requests, which means an open round holds only bids placed before the halt
+// - a fixed set of third parties whose collateral is stranded for as long as the round stays open.
+// Leaving it open indefinitely harms them for no benefit; lending it would put the pool's money
+// into the elector for a round and a hold, which is the opposite of what halting was for. Waiting
+// for the refund branch resolves the round, returns the collateral and lends nothing.
+func (v View) participateDue(round uint32) bool {
+	if v.Now < participateAt(v.Treasury.Times.ParticipateSince, round) {
+		return false
+	}
+	if v.Treasury.Stopped {
+		return v.refundOnlyFor(round)
+	}
+	return true
+}
+
+// refundOnlyFor reports whether distribute would take its reject-everything branch for this round,
+// mirroring:
+//
+//	int elected?  = ~ config_param(config::next_validators).null?();
+//	int too_late? = now() >= min(participate_until, round_since);
+//	if elected? | too_late? { ... }
+//
+// Both arms are read where the contract reads them: config 36's presence, and get_times'
+// participate_until against the round's own start.
+func (v View) refundOnlyFor(round uint32) bool {
+	if v.refundOnly() {
+		return true
+	}
+	return v.Now >= participateAt(v.Treasury.Times.ParticipateUntil, round)
+}
+
+// refundOnly is the half of that condition which needs no treasury read: once the next validator
+// set exists, distribute refunds whatever it is given, for any round. That is what lets blind mode
+// keep retiring stranded open rounds after its participate window has closed, instead of leaving
+// their borrowers' collateral locked up until somebody notices.
+func (v View) refundOnly() bool {
+	return v.Network.NextSince != 0
 }
 
 // participateAt is the treasury's own condition: now() >= min(participate_since, round_since).
@@ -123,10 +168,18 @@ func NextDeadline(v View) (uint32, bool) {
 		p := v.Treasury.Participations[round]
 		switch p.State {
 		case StateOpen:
-			if v.Treasury.Stopped {
-				continue
+			if v.participateDue(round) {
+				continue // already due; a future deadline would send the loop past it
 			}
-			if at := participateAt(v.Treasury.Times.ParticipateSince, round); at > v.Now {
+			at := participateAt(v.Treasury.Times.ParticipateSince, round)
+			if v.Treasury.Stopped {
+				// Waiting for distribute's refund branch, not the election window. Its other
+				// arm - the next validator set appearing - can arrive earlier than this and
+				// cannot be predicted, so this is an upper bound and the 10-minute sleep cap is
+				// what picks that case up.
+				at = participateAt(v.Treasury.Times.ParticipateUntil, round)
+			}
+			if at > v.Now {
 				deadlines = append(deadlines, at)
 			}
 		case StateStaked, StateValidating:
