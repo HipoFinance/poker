@@ -108,6 +108,25 @@ func TestVsetTimesReadsAValidatorSet(t *testing.T) {
 	if _, _, err := vsetTimes(participationCell(t, StateHeld, currentHash, 0)); err == nil {
 		t.Fatal("a participation cell was read as a validator set")
 	}
+
+	// An inverted pair must be refused rather than read. Candidates() subtracts these two to get
+	// the epoch length it steps back by, so utime_until <= utime_since underflows uint32 into
+	// roughly four billion, passes the `epoch > 0` test, and has blind mode aiming at rounds that
+	// never existed.
+	for _, bad := range [][2]uint32{{currRound, currRound}, {nextRound, currRound}} {
+		if _, _, err := vsetTimes(vsetCell(t, bad[0], bad[1])); err == nil {
+			t.Fatalf("a validator set running from %v to %v was accepted", bad[0], bad[1])
+		}
+	}
+
+	// And the epoch that comes out of a good one is the round length, not something derived.
+	n, err := buildNetworkConfig(vsetCell(t, prevRound, currRound), vsetCell(t, currRound, nextRound), nil)
+	if err != nil {
+		t.Fatalf("buildNetworkConfig: %v", err)
+	}
+	if got := n.CurrentUntil - n.CurrentSince; got != 65536 {
+		t.Fatalf("epoch length is %v, want 65536", got)
+	}
 }
 
 // TestBlindWindow is the halt guard's fallback. Blind mode cannot read stopped?, so it fires
