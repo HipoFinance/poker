@@ -40,7 +40,16 @@ strands the collateral of borrowers who bid before the halt.
 
 **A send is not a confirmation.** An external that fails a guard leaves no transaction and no
 receipt. Anything that reports success on `SendExternalMessage` returning nil is wrong; the
-`Tracker` and the state re-read are how a transition is established.
+`Tracker` and the state re-read are how a transition is established. Two rules keep that series
+honest and both were got wrong once: only what actually **left** starts a clock (never what was
+merely due, or logged by a dry run), and a poke is confirmed against `DueByContract` — what the
+treasury would still accept — never against what this service chose to send.
+
+**The burst is measured from the newest send, the alert from the oldest.** `schedule` feeds
+`Tracker.Newest` into `NextWait`. It used to feed `Oldest`, which meant one wedged round put every
+cycle on the plain retry interval and silently switched off the first-opportunity burst for every
+other round. `TestScheduleUsesTheNewestSend` pins it at the wiring, because a unit test on
+`NextWait` alone passed throughout.
 
 **Timing is on the chain's clock.** Never schedule against `time.Now()` directly; go through
 `Clock`.

@@ -24,8 +24,8 @@ var (
 	staleHash   = big.NewInt(0x123456)
 )
 
-// precise builds a trusted view holding exactly one round.
-func precise(t *testing.T, round uint32, state State, vsetHash *big.Int, stakeHeldUntil uint32, stopped bool, participateSince, now uint32) View {
+// trustedView builds a view with a trusted treasury read, holding exactly one round.
+func trustedView(t *testing.T, round uint32, state State, vsetHash *big.Int, stakeHeldUntil uint32, stopped bool, participateSince, now uint32) View {
 	t.Helper()
 	rounds := map[uint32]*cell.Cell{
 		round: participationCell(t, state, vsetHash, stakeHeldUntil),
@@ -46,7 +46,6 @@ func precise(t *testing.T, round uint32, state State, vsetHash *big.Int, stakeHe
 			CurrentUntil:    nextRound,
 			PreviousSince:   prevRound,
 			PreviousUntil:   currRound,
-			StakeHeldFor:    32768,
 		},
 		Treasury: ts,
 	}
@@ -107,7 +106,7 @@ func TestDueByState(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// participate_since in the past, so the open case turns on the state rather than the
 			// clock; the clock is TestParticipateIsNotDueEarly's subject.
-			v := precise(t, tt.round, tt.state, tt.hash, tt.until, false, testNow-600, testNow)
+			v := trustedView(t, tt.round, tt.state, tt.hash, tt.until, false, testNow-600, testNow)
 			got := Due(v, time.Now())
 			if !sameOps(got, tt.want) {
 				t.Fatalf("got %v, want %v", ops(got), tt.want)
@@ -127,19 +126,19 @@ func TestDueByState(t *testing.T) {
 // entirely - is legal to participate in immediately, and poking it is how its borrowers get their
 // collateral back rather than leaving it open forever.
 func TestParticipateIsNotDueEarly(t *testing.T) {
-	early := precise(t, nextRound, StateOpen, currentHash, 0, false, electionAt, testNow)
+	early := trustedView(t, nextRound, StateOpen, currentHash, 0, false, electionAt, testNow)
 	if got := Due(early, time.Now()); len(got) != 0 {
 		t.Fatalf("poked %v before the election window opened at %v: %v", testNow, electionAt, ops(got))
 	}
 
-	onTime := precise(t, nextRound, StateOpen, currentHash, 0, false, electionAt, electionAt)
+	onTime := trustedView(t, nextRound, StateOpen, currentHash, 0, false, electionAt, electionAt)
 	if got := Due(onTime, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
 		t.Fatalf("did not poke at participate_since: %v", ops(got))
 	}
 
 	// The round_since arm: a stranded open round whose start has passed, with an election window
 	// still notionally in the future.
-	stranded := precise(t, prevRound, StateOpen, currentHash, 0, false, electionAt, testNow)
+	stranded := trustedView(t, prevRound, StateOpen, currentHash, 0, false, electionAt, testNow)
 	if got := Due(stranded, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
 		t.Fatalf("a stranded open round was left unpoked: %v", ops(got))
 	}
@@ -157,19 +156,19 @@ func TestStoppedDefersParticipateToTheRefundBranch(t *testing.T) {
 	// participate_until is participate_since + 600, so the refund branch opens at electionAt+600.
 	const refundAt = electionAt + 600
 
-	inWindow := precise(t, nextRound, StateOpen, currentHash, 0, true, electionAt, electionAt+1)
+	inWindow := trustedView(t, nextRound, StateOpen, currentHash, 0, true, electionAt, electionAt+1)
 	if got := Due(inWindow, time.Now()); len(got) != 0 {
 		t.Fatalf("a halted treasury was poked inside the election window, which lends: %v", ops(got))
 	}
 
-	afterWindow := precise(t, nextRound, StateOpen, currentHash, 0, true, electionAt, refundAt)
+	afterWindow := trustedView(t, nextRound, StateOpen, currentHash, 0, true, electionAt, refundAt)
 	if got := Due(afterWindow, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
 		t.Fatalf("a halted treasury left its open round stranded past participate_until: %v", ops(got))
 	}
 
 	// The other arm of distribute's condition: once the next validator set exists, distribute
 	// refunds whatever it is given, whatever the clock says.
-	elected := precise(t, nextRound, StateOpen, currentHash, 0, true, electionAt, electionAt+1)
+	elected := trustedView(t, nextRound, StateOpen, currentHash, 0, true, electionAt, electionAt+1)
 	elected.Network.NextSince = nextRound
 	if got := Due(elected, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
 		t.Fatalf("the elected? arm of the refund branch was not used: %v", ops(got))
@@ -177,7 +176,7 @@ func TestStoppedDefersParticipateToTheRefundBranch(t *testing.T) {
 
 	// A stale open round - one whose own start has passed - is past min(participate_until,
 	// round_since) by definition, so its borrowers get their collateral back immediately.
-	stale := precise(t, prevRound, StateOpen, currentHash, 0, true, electionAt, testNow)
+	stale := trustedView(t, prevRound, StateOpen, currentHash, 0, true, electionAt, testNow)
 	if got := Due(stale, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
 		t.Fatalf("a stale open round stayed stranded on a halted treasury: %v", ops(got))
 	}
@@ -186,12 +185,12 @@ func TestStoppedDefersParticipateToTheRefundBranch(t *testing.T) {
 // Settling must be completely unaffected by a halt, or in-flight rounds never finish and their
 // unstake bills are never paid.
 func TestStoppedStillSettles(t *testing.T) {
-	held := precise(t, prevRound, StateHeld, currentHash, testNow-1, true, electionAt, testNow)
+	held := trustedView(t, prevRound, StateHeld, currentHash, testNow-1, true, electionAt, testNow)
 	if got := Due(held, time.Now()); !sameOps(got, []Op{OpFinishParticipation}) {
 		t.Fatalf("a stopped treasury stopped settling: %v", ops(got))
 	}
 
-	staked := precise(t, currRound, StateStaked, staleHash, 0, true, electionAt, testNow)
+	staked := trustedView(t, currRound, StateStaked, staleHash, 0, true, electionAt, testNow)
 	if got := Due(staked, time.Now()); !sameOps(got, []Op{OpVsetChanged}) {
 		t.Fatalf("a stopped treasury stopped observing the validator set: %v", ops(got))
 	}
@@ -199,7 +198,7 @@ func TestStoppedStillSettles(t *testing.T) {
 
 // An unhalted treasury must still lend at the normal moment, or the pool simply stops earning.
 func TestNotStoppedParticipatesInTheElectionWindow(t *testing.T) {
-	v := precise(t, nextRound, StateOpen, currentHash, 0, false, electionAt, electionAt)
+	v := trustedView(t, nextRound, StateOpen, currentHash, 0, false, electionAt, electionAt)
 	if got := Due(v, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
 		t.Fatalf("a healthy treasury did not lend at participate_since: %v", ops(got))
 	}
@@ -223,7 +222,7 @@ func TestNextDeadline(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			v := precise(t, tt.round, tt.state, tt.hash, tt.until, false, electionAt, testNow)
+			v := trustedView(t, tt.round, tt.state, tt.hash, tt.until, false, electionAt, testNow)
 			got, ok := NextDeadline(v)
 			if !ok || got != tt.want {
 				t.Fatalf("got %v (ok=%v), want %v", got, ok, tt.want)
@@ -233,14 +232,14 @@ func TestNextDeadline(t *testing.T) {
 
 	// A round that is already due must not contribute a future deadline, or the loop would sleep
 	// past the poke it should be sending right now.
-	rotated := precise(t, currRound, StateStaked, staleHash, 0, false, electionAt, testNow)
+	rotated := trustedView(t, currRound, StateStaked, staleHash, 0, false, electionAt, testNow)
 	if d, ok := NextDeadline(rotated); ok {
 		t.Fatalf("an already-due round produced a future deadline of %v", d)
 	}
 
 	// A stopped treasury waits for the refund branch, not the election window, so its deadline
 	// is participate_until rather than participate_since.
-	stopped := precise(t, nextRound, StateOpen, currentHash, 0, true, electionAt, testNow)
+	stopped := trustedView(t, nextRound, StateOpen, currentHash, 0, true, electionAt, testNow)
 	d, ok := NextDeadline(stopped)
 	if !ok || d != electionAt+600 {
 		t.Fatalf("a halted treasury scheduled %v (ok=%v), want the refund branch at %v", d, ok, electionAt+600)

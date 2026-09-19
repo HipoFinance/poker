@@ -61,6 +61,12 @@ func (p *Poker) Run(ctx context.Context) {
 func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	session, err := p.chain.Session(ctx)
 	if err != nil {
+		// Nothing was observed this cycle, so nothing may be claimed. Leaving the last ages
+		// published would freeze them at whatever they were: a poke that happened to be one
+		// retry old when the chain went away would then fire PokerPokeUnconfirmed for the whole
+		// outage, with a description about the treasury refusing a message nobody could send.
+		// PokerReadFailing is the alert for this.
+		PublishOutstanding(nil)
 		log.Printf("❌ No liteserver answered: %v", err)
 		return RetryInterval, "no endpoint"
 	}
@@ -70,6 +76,7 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	} else {
 		p.clock.Observe(chainNow)
 		ClockOffset.Set(float64(p.clock.Offset()))
+		ClockSynced.Set(1)
 	}
 
 	network, err := session.NetworkConfig(session.Ctx)
@@ -78,6 +85,7 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 		// even blind mode has anything to aim at. This is "cannot reach the chain", which is a
 		// different failure from "cannot trust the treasury" and is reported by
 		// hipo_poker_last_read_success_seconds ageing rather than by blind mode.
+		PublishOutstanding(nil)
 		log.Printf("❌ Could not read the network config: %v", err)
 		return RetryInterval, "no network config"
 	}
@@ -108,11 +116,18 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	due := Due(view, wall)
 	p.logView(view, due)
 
-	// Confirmation only means something in precise mode. Blind mode has every op due for every
-	// candidate on every cycle, so nothing ever leaves the due set and an age tracked there would
-	// grow without bound and read as a wedge. PokerBlindMode is the signal for that.
+	// Sending comes first so that only what actually left starts a clock. A poke no liteserver
+	// accepted, or one a dry run merely logged, is not evidence that the treasury is refusing
+	// anything, and treating it as such pages someone for a broken network path with a message
+	// about a wedged round.
+	sent := p.send(ctx, due)
+
+	// Confirmation is measured against what the treasury would still accept, never against what
+	// this service chose to send, so a halt taking effect mid-window cannot be mistaken for a
+	// transition. Blind mode computes no such set and publishes no ages: it cannot confirm
+	// anything, and PokerBlindMode is the signal for that.
 	if !p.blind.Blind() {
-		for _, c := range p.tracker.Observe(due, wall) {
+		for _, c := range p.tracker.Observe(DueByContract(view), sent, wall) {
 			log.Printf("✅ %v confirmed: the state moved", c)
 			Confirmed.WithLabelValues(c.Op.String()).Inc()
 		}
@@ -121,12 +136,11 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 		PublishOutstanding(nil)
 	}
 
-	p.send(ctx, due)
-
 	return p.schedule(view, wall, len(due) > 0)
 }
 
-func (p *Poker) send(ctx context.Context, due []Poke) {
+func (p *Poker) send(ctx context.Context, due []Poke) []Poke {
+	var sent []Poke
 	for _, poke := range due {
 		if p.dryRun {
 			log.Printf("🧪 Would send %v", poke)
@@ -142,7 +156,9 @@ func (p *Poker) send(ctx context.Context, due []Poke) {
 		// accepts them is decided by a guard that leaves no receipt either way.
 		log.Printf("📨 Sent %v", poke)
 		PokesSent.WithLabelValues(poke.Op.String()).Inc()
+		sent = append(sent, poke)
 	}
+	return sent
 }
 
 func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration, string) {
@@ -151,9 +167,11 @@ func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration
 		// towards and nothing to chase. Plain retries until the read comes back.
 		return RetryInterval, "blind"
 	}
+	// The NEWEST, not the oldest: this answers "did we send something a moment ago", and using
+	// the oldest let one wedged round switch off the burst for every other round.
 	var age time.Duration
-	if _, oldest, ok := p.tracker.Oldest(wall); ok {
-		age = oldest
+	if _, newest, ok := p.tracker.Newest(wall); ok {
+		age = newest
 	}
 	deadline, haveDeadline := NextDeadline(view)
 	var until time.Duration
@@ -166,14 +184,13 @@ func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration
 func (p *Poker) setBlind(readErr error) {
 	entered, left := p.blind.Observe(readErr, time.Now())
 	if entered {
-		p.tracker.Reset()
+		BlindEntries.Inc()
 		log.Printf("🙈 Blind mode: %v", readErr)
 		log.Printf("🙈 Poking every candidate round from the network config. "+
 			"participate_in_election is included for the next %v, then withdrawn.",
 			BlindParticipateWindow)
 	}
 	if left {
-		p.tracker.Reset()
 		log.Printf("👁  Treasury state is readable again")
 	}
 	if p.blind.Blind() {
@@ -193,7 +210,17 @@ func (p *Poker) logView(view View, due []Poke) {
 	}
 	halted := ""
 	if view.Treasury.Stopped {
-		halted = ", treasury STOPPED so participate_in_election is withheld"
+		// Which of the two it is matters more than the halt itself: sending this message to a
+		// halted pool is the most consequential thing this service ever does, and an operator
+		// reading the log during an incident must not be told the opposite of what happened.
+		halted = ", treasury STOPPED so participate_in_election waits for distribute's refund branch"
+		for _, poke := range due {
+			if poke.Op == OpParticipateInElection {
+				halted = ", treasury STOPPED and participate_in_election IS being sent: " +
+					"distribute will refund this round's requests, not stake them"
+				break
+			}
+		}
 	}
 	for _, round := range view.Treasury.Rounds() {
 		part := view.Treasury.Participations[round]

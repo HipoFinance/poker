@@ -96,6 +96,9 @@ func TestNextWait(t *testing.T) {
 
 // The burst is only worth its noise if it actually brackets the deadline. Walking a clock through
 // it second by second is what proves the loop is awake on both sides.
+//
+// NextDeadline only ever reports a deadline still in the future, so once the moment passes the
+// loop is driven by the now-outstanding poke rather than by a deadline. The fixture models that.
 func TestBurstBracketsTheDeadline(t *testing.T) {
 	var c Clock
 	base := time.Now().Unix()
@@ -105,13 +108,12 @@ func TestBurstBracketsTheDeadline(t *testing.T) {
 	awakeAt := map[int64]bool{}
 	for offset := int64(-5); offset <= 5; offset++ {
 		c.Observe(uint32(base + 30 + offset))
-		until := c.Until(deadline)
 		pending := offset >= 0 // the poke becomes due at the deadline and is sent from then on
 		var since time.Duration
 		if pending {
 			since = time.Duration(offset) * time.Second
 		}
-		wait, _ := NextWait(pending, since, until, true)
+		wait, _ := NextWait(pending, since, c.Until(deadline), !pending)
 		awakeAt[offset] = wait == BurstTick
 	}
 
@@ -122,5 +124,67 @@ func TestBurstBracketsTheDeadline(t *testing.T) {
 	}
 	if awakeAt[5] {
 		t.Fatal("the burst never closed")
+	}
+}
+
+// TestNextWaitDoesNotSleepPastASecondTransition is the regression for the bug that disabled the
+// headline feature. A round wedged for ten minutes must not stop the loop from waking for another
+// round whose deadline is seconds away.
+func TestNextWaitDoesNotSleepPastASecondTransition(t *testing.T) {
+	// A poke outstanding for ten minutes - the state PokerPokeUnconfirmed fires on - and another
+	// round's transition twenty seconds out.
+	wait, reason := NextWait(true, 10*time.Minute, 20*time.Second, true)
+	if wait != 20*time.Second-BurstLead {
+		t.Fatalf("with a wedged round pending, a deadline %v away produced a %v sleep (%v); "+
+			"the second transition would wait for the retry interval", 20*time.Second, wait, reason)
+	}
+
+	// The same, with the deadline already inside the lead.
+	if wait, _ := NextWait(true, 10*time.Minute, time.Second, true); wait != BurstTick {
+		t.Fatalf("an imminent deadline did not open the burst while a poke was outstanding: %v", wait)
+	}
+
+	// And the burst tail still wins outright: nothing is sooner than one second.
+	if wait, _ := NextWait(true, time.Second, 20*time.Second, true); wait != BurstTick {
+		t.Fatalf("a just-sent poke left the burst cadence: %v", wait)
+	}
+
+	// A far deadline must not drag a pending retry out to MaxSleep.
+	if wait, r := NextWait(true, 10*time.Minute, 4*time.Hour, true); wait != RetryInterval {
+		t.Fatalf("a pending poke waited %v (%v), want the retry interval", wait, r)
+	}
+}
+
+// TestScheduleUsesTheNewestSend covers the bug at its real site.
+//
+// NextWait had the right rule and `schedule` handed it the wrong number: the oldest outstanding
+// age rather than the newest. A unit test on NextWait alone passed throughout, which is why this
+// one exists at the wiring instead.
+func TestScheduleUsesTheNewestSend(t *testing.T) {
+	p := &Poker{clock: &Clock{}, tracker: NewTracker()}
+	p.clock.Observe(testNow)
+	wall := time.Now()
+
+	// A round wedged for ten minutes, exactly the state PokerPokeUnconfirmed fires on.
+	wedged := Poke{Op: OpParticipateInElection, RoundSince: nextRound}
+	p.tracker.Observe([]Poke{wedged}, []Poke{wedged}, wall.Add(-10*time.Minute))
+
+	// Meanwhile another round's stake_held_until is twenty seconds away.
+	v := trustedView(t, prevRound, StateHeld, currentHash, testNow+20, false, electionAt, testNow)
+
+	wait, reason := p.schedule(v, wall, true)
+	if wait > 20*time.Second {
+		t.Fatalf("slept %v (%v) past a transition %v away, because another round is wedged",
+			wait, reason, 20*time.Second)
+	}
+
+	// And the burst tail: a second poke sent THIS cycle, alongside the wedged one. The newest age
+	// is zero and the cadence must be one second; the oldest age is ten minutes and would put the
+	// loop on the plain retry, losing the burst for the round that just became due.
+	fresh := Poke{Op: OpFinishParticipation, RoundSince: prevRound}
+	p.tracker.Observe([]Poke{wedged, fresh}, []Poke{fresh}, wall)
+	if wait, reason := p.schedule(v, wall, true); wait != BurstTick {
+		t.Fatalf("a poke sent this cycle did not hold the burst cadence: %v (%v); "+
+			"the oldest outstanding poke is being used instead of the newest", wait, reason)
 	}
 }

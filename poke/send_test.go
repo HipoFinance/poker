@@ -61,15 +61,16 @@ func TestTracker(t *testing.T) {
 	tr := NewTracker()
 	start := time.Now()
 	poke := Poke{Op: OpFinishParticipation, RoundSince: prevRound}
+	due := []Poke{poke}
 
-	if confirmed := tr.Observe([]Poke{poke}, start); len(confirmed) != 0 {
+	if confirmed := tr.Observe(due, due, start); len(confirmed) != 0 {
 		t.Fatalf("a freshly sent poke was reported as confirmed: %v", confirmed)
 	}
 
 	// Still due a minute later: the send went through and nothing happened. This is the shape of
 	// the incident the whole service exists for, and it has to be visible.
 	later := start.Add(time.Minute)
-	if confirmed := tr.Observe([]Poke{poke}, later); len(confirmed) != 0 {
+	if confirmed := tr.Observe(due, due, later); len(confirmed) != 0 {
 		t.Fatalf("an unacknowledged poke was reported as confirmed: %v", confirmed)
 	}
 	got, age, ok := tr.Oldest(later)
@@ -81,7 +82,7 @@ func TestTracker(t *testing.T) {
 	}
 
 	// The state moved: the poke is no longer due, which is the only confirmation there is.
-	confirmed := tr.Observe(nil, later.Add(time.Second))
+	confirmed := tr.Observe(nil, nil, later.Add(time.Second))
 	if len(confirmed) != 1 || confirmed[0] != poke {
 		t.Fatalf("the transition was not detected: %v", confirmed)
 	}
@@ -93,15 +94,86 @@ func TestTracker(t *testing.T) {
 	}
 }
 
-// Reset is what keeps blind mode from reporting a wedge. There every op is due for every
-// candidate on every cycle, so nothing ever leaves the due set and an age carried across that
-// boundary would grow without bound.
-func TestTrackerResetOnBlindBoundary(t *testing.T) {
+// Only what actually left starts a clock. A poke no liteserver accepted - or one a dry run merely
+// logged - is not evidence that the treasury is refusing anything, and counting it as outstanding
+// pages someone about a wedged round when the real fault is this host's network path.
+func TestTrackerIgnoresWhatWasNotSent(t *testing.T) {
+	tr := NewTracker()
+	now := time.Now()
+	due := []Poke{{Op: OpParticipateInElection, RoundSince: nextRound}}
+
+	tr.Observe(due, nil, now)
+	if _, _, ok := tr.Oldest(now.Add(time.Hour)); ok {
+		t.Fatal("a poke that was never sent became outstanding")
+	}
+	if len(tr.Outstanding(now.Add(time.Hour))) != 0 {
+		t.Fatal("a poke that was never sent was published")
+	}
+
+	// And once it is sent, the clock starts from then rather than from when it first became due.
+	tr.Observe(due, due, now.Add(time.Hour))
+	if _, age, ok := tr.Oldest(now.Add(time.Hour)); !ok || age != 0 {
+		t.Fatalf("the clock did not start at the send: age %v (ok=%v)", age, ok)
+	}
+}
+
+// Confirmation is measured against the treasury's own guards, not against what this service chose
+// to send. Otherwise the governor halting the pool mid-window - which makes participate stop being
+// due by policy - would be logged and counted as a state transition that never happened.
+func TestTrackerDoesNotConfirmOnAPolicyChange(t *testing.T) {
+	tr := NewTracker()
+	now := time.Now()
+	poke := Poke{Op: OpParticipateInElection, RoundSince: nextRound}
+
+	tr.Observe([]Poke{poke}, []Poke{poke}, now)
+
+	// The treasury would still accept it; only this service has decided to hold off.
+	confirmed := tr.Observe([]Poke{poke}, nil, now.Add(time.Minute))
+	if len(confirmed) != 0 {
+		t.Fatalf("a policy change was counted as a transition: %v", confirmed)
+	}
+	if _, age, ok := tr.Oldest(now.Add(time.Minute)); !ok || age != time.Minute {
+		t.Fatalf("the poke stopped being outstanding: age %v (ok=%v)", age, ok)
+	}
+}
+
+// Newest is what the burst cadence is measured against. Oldest is what the alert is measured
+// against. Using the oldest for both is what let a single wedged round switch off the burst for
+// every other round.
+func TestTrackerNewestAndOldest(t *testing.T) {
 	tr := NewTracker()
 	start := time.Now()
-	tr.Observe([]Poke{{Op: OpVsetChanged, RoundSince: currRound}}, start)
-	tr.Reset()
-	if _, _, ok := tr.Oldest(start.Add(time.Hour)); ok {
-		t.Fatal("an age survived the blind-mode boundary and would read as a wedge")
+	wedged := Poke{Op: OpParticipateInElection, RoundSince: nextRound}
+	fresh := Poke{Op: OpFinishParticipation, RoundSince: prevRound}
+
+	tr.Observe([]Poke{wedged}, []Poke{wedged}, start)
+	later := start.Add(10 * time.Minute)
+	tr.Observe([]Poke{wedged, fresh}, []Poke{fresh}, later)
+
+	if p, age, _ := tr.Oldest(later); p != wedged || age != 10*time.Minute {
+		t.Fatalf("oldest is %v aged %v, want the wedged poke aged 10m", p, age)
+	}
+	if p, age, _ := tr.Newest(later); p != fresh || age != 0 {
+		t.Fatalf("newest is %v aged %v, want the fresh poke aged 0", p, age)
+	}
+}
+
+// Reset must not be wired to the blind-mode boundary. It used to be, and a treasury read failing
+// every few minutes then reset every age on each flap - so no poke ever reached the alert
+// threshold while PokerBlindMode never saw five continuous minutes either, and a genuinely stuck
+// round raised nothing at all.
+func TestTrackerSurvivesABlindFlap(t *testing.T) {
+	tr := NewTracker()
+	start := time.Now()
+	poke := Poke{Op: OpFinishParticipation, RoundSince: prevRound}
+	due := []Poke{poke}
+
+	tr.Observe(due, due, start)
+	// Three blind cycles in between, during which nothing is observed and nothing is confirmed.
+	later := start.Add(4 * time.Minute)
+	tr.Observe(due, due, later)
+
+	if _, age, ok := tr.Oldest(later); !ok || age != 4*time.Minute {
+		t.Fatalf("age is %v (ok=%v) after a blind flap, want 4m; a wedge would be invisible", age, ok)
 	}
 }

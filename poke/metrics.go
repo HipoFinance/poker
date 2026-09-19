@@ -72,11 +72,31 @@ var (
 		Help: "Minimum get_treasury_state tuple length this build was written against.",
 	})
 
-	// ClockOffset is the correction applied to the host clock, in seconds. A number drifting away
-	// from zero is a host whose clock is wrong; the poker copes, but it is worth seeing.
+	// ClockOffset is the correction applied to the host clock, in seconds. The poker copes with
+	// any value, but a number far from zero means one of the two clocks is wrong - and the host's
+	// being wrong also skews every `time() - <timestamp>` alert below, which Prometheus evaluates
+	// against its own clock.
 	ClockOffset = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "hipo_poker_clock_offset_seconds",
 		Help: "Chain time minus host time, in seconds.",
+	})
+
+	// ClockSynced is 0 until the chain's clock has actually been read. Without it an offset of
+	// zero is ambiguous: it reads identically for "perfectly synced" and "never observed, so
+	// every deadline is being computed on raw host time". That second case is what makes a badly
+	// skewed host fire everything, confirm nothing, and look fine.
+	ClockSynced = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "hipo_poker_clock_synced",
+		Help: "1 once the chain's clock has been observed at least once.",
+	})
+
+	// BlindEntries counts transitions INTO blind mode, which is what makes an intermittently
+	// failing read visible. A read that fails every few minutes never gives PokerBlindMode five
+	// continuous minutes to fire, so without this it raises nothing while being just as broken as
+	// a read that fails outright.
+	BlindEntries = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "hipo_poker_blind_entries_total",
+		Help: "Number of times the poker has entered blind mode.",
 	})
 )
 
@@ -84,16 +104,32 @@ func init() {
 	LastReadSuccess.Set(float64(time.Now().Unix()))
 	TreasuryStateFieldsExpected.Set(treasuryStateMinFields)
 	BlindModeSince.Set(0)
+	ClockSynced.Set(0)
 }
 
-// PublishOutstanding replaces the unconfirmed-poke series with the current set. The vector is
-// reset rather than updated so that a confirmed poke's series disappears instead of ageing
-// forever - the same trick gauge uses for per-round series, and what makes every alert built on
-// it self-resolve.
+// published is the label set currently exported by UnconfirmedPoke, so that stale series can be
+// removed one at a time instead of clearing the whole vector.
+var published = map[[2]string]bool{}
+
+// PublishOutstanding replaces the unconfirmed-poke series with the current set, so that a
+// confirmed poke's series disappears instead of ageing forever and every alert built on it
+// self-resolves.
+//
+// It deletes what is gone rather than calling Reset first. Reset-then-refill leaves a window in
+// which the vector is empty, and a scrape landing inside it reads as "nothing outstanding" - which
+// on an alert with no `for:` shows up as a resolve followed by a re-fire. The window is tiny and
+// the scrape is every 15 seconds, so it would be rare, confusing and very hard to reproduce.
 func PublishOutstanding(outstanding map[Poke]time.Duration) {
-	UnconfirmedPoke.Reset()
+	current := make(map[[2]string]bool, len(outstanding))
 	for p, age := range outstanding {
-		UnconfirmedPoke.WithLabelValues(p.Op.String(), strconv.FormatUint(uint64(p.RoundSince), 10)).
-			Set(age.Seconds())
+		labels := [2]string{p.Op.String(), strconv.FormatUint(uint64(p.RoundSince), 10)}
+		current[labels] = true
+		UnconfirmedPoke.WithLabelValues(labels[0], labels[1]).Set(age.Seconds())
 	}
+	for labels := range published {
+		if !current[labels] {
+			UnconfirmedPoke.DeleteLabelValues(labels[0], labels[1])
+		}
+	}
+	published = current
 }

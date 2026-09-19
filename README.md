@@ -73,7 +73,9 @@ pool lends nothing. Settling is never withheld in any mode.
 
 Blind mode cannot see `stopped?`, so it participates normally for two hours — with an alert — and
 after that only while config 36 exists, which is the half of the refund condition that needs no
-treasury read.
+treasury read. Its candidate rounds reach several epochs back from the previous validator set,
+because the treasury can hold eight participations while the validator sets name only three — and a
+round that missed two rotations is exactly the kind this service exists to rescue.
 
 ## Configuration
 
@@ -93,10 +95,16 @@ one of the cases this service exists to survive.
 ## Metrics
 
 `hipo_poker_last_read_success_seconds`, `hipo_poker_blind_mode`,
-`hipo_poker_blind_mode_since_seconds`, `hipo_poker_unconfirmed_poke_seconds{op,round_since}`,
-`hipo_poker_pokes_sent_total{op}`, `hipo_poker_poke_errors_total{op}`,
-`hipo_poker_confirmed_transitions_total{op}`, `hipo_poker_treasury_state_fields`,
-`hipo_poker_treasury_state_fields_expected`, `hipo_poker_clock_offset_seconds`.
+`hipo_poker_blind_mode_since_seconds`, `hipo_poker_blind_entries_total`,
+`hipo_poker_unconfirmed_poke_seconds{op,round_since}`, `hipo_poker_pokes_sent_total{op}`,
+`hipo_poker_poke_errors_total{op}`, `hipo_poker_confirmed_transitions_total{op}`,
+`hipo_poker_treasury_state_fields`, `hipo_poker_treasury_state_fields_expected`,
+`hipo_poker_clock_offset_seconds`, `hipo_poker_clock_synced`.
+
+`hipo_poker_unconfirmed_poke_seconds` counts only pokes that actually left for a liteserver, and a
+poke is confirmed when the *treasury* would no longer accept it — not when this service stops
+choosing to send it. Both distinctions exist so the series means "the chain is refusing us" rather
+than "something changed on our side".
 
 There is deliberately no per-round participation state here: `gauge` already publishes
 `hipo_treasury_participation_state` and the round-lifecycle alerts are built on it. A second

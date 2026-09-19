@@ -17,36 +17,81 @@ func blindNetwork() NetworkConfig {
 	}
 }
 
-// TestCandidatesReachEveryLiveRound pins what blind mode aims at. A round in held or recovering
-// carries the round_since of a set that has already rotated, and with an 18-hour round and a
-// 9-hour hold that is at most the previous set - so config 32 reaches one full set further back
-// than anything that can still be waiting.
-func TestCandidatesReachEveryLiveRound(t *testing.T) {
+// TestCandidatesReachEveryRoundTheTreasuryCanHold pins what blind mode aims at.
+//
+// The validator sets name only three rounds, but request_loan lets the treasury hold eight
+// (treasury.fc:726). A round that missed two rotations, or one left in `held` well past its
+// stake_held_until, has a round_since older than config 32 - and those are exactly the incidents
+// the spec's Problem section describes. Reaching only as far as the previous set would make blind
+// mode unable to see precisely the rounds it exists to rescue, and blind mode has no exit timer:
+// it lasts until a human fixes the read.
+func TestCandidatesReachEveryRoundTheTreasuryCanHold(t *testing.T) {
 	got := blindNetwork().Candidates()
-	want := []uint32{prevRound, currRound, nextRound}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			t.Fatalf("got %v, want %v (oldest first)", got, want)
+
+	const epoch = uint32(65536)
+	for _, want := range []uint32{prevRound, currRound, nextRound} {
+		if !containsRound(got, want) {
+			t.Fatalf("candidate set %v is missing the live round %v", got, want)
 		}
 	}
 
-	// During an election config 36 is present and names the round being elected. It is normally
-	// the same value as the current set's utime_until, and must not be listed twice.
-	electing := blindNetwork()
-	electing.NextSince = nextRound
-	if got := electing.Candidates(); len(got) != 3 {
-		t.Fatalf("config 36 duplicated a candidate: %v", got)
+	// Eight participations is the most the treasury will hold, so the reach has to cover that
+	// many rounds back from the newest one.
+	for k := uint32(1); k <= 5; k++ {
+		want := prevRound - k*epoch
+		if !containsRound(got, want) {
+			t.Fatalf("candidate set does not reach %v epochs back (missing %v): %v", k+1, want, got)
+		}
+	}
+	if len(got) < 8 {
+		t.Fatalf("only %d candidate rounds, fewer than the 8 the treasury can hold: %v", len(got), got)
 	}
 
-	// Outside the election window config 36 is absent, which is normal and not a gap.
-	absent := blindNetwork()
-	absent.NextSince = 0
-	if got := absent.Candidates(); len(got) != 3 {
-		t.Fatalf("an absent config 36 changed the candidate set: %v", got)
+	// Oldest first, so a round that has been waiting longest is poked first, and no duplicates.
+	seen := map[uint32]bool{}
+	for i, v := range got {
+		if seen[v] {
+			t.Fatalf("candidate %v is listed twice: %v", v, got)
+		}
+		seen[v] = true
+		if i > 0 && got[i-1] >= v {
+			t.Fatalf("candidates are not oldest first: %v", got)
+		}
 	}
+
+	// During an election config 36 names the round being elected. It is normally the same value
+	// as the current set's utime_until, and must not be listed twice.
+	electing := blindNetwork()
+	electing.NextSince = nextRound
+	if len(electing.Candidates()) != len(got) {
+		t.Fatalf("config 36 duplicated a candidate: %v", electing.Candidates())
+	}
+}
+
+// A chain with no previous validator set, or an unreadable epoch length, must not underflow into
+// enormous round numbers or drop the rounds it does know about.
+func TestCandidatesDegradeSafely(t *testing.T) {
+	young := NetworkConfig{CurrentVsetHash: currentHash, CurrentSince: 100, CurrentUntil: 200}
+	for _, v := range young.Candidates() {
+		if v == 0 || v > 200 {
+			t.Fatalf("a chain younger than the reach produced candidate %v: %v", v, young.Candidates())
+		}
+	}
+
+	// CurrentUntil == CurrentSince gives a zero epoch; stepping by it would loop on one value.
+	flat := NetworkConfig{CurrentVsetHash: currentHash, PreviousSince: 50, CurrentSince: 100, CurrentUntil: 100}
+	if got := flat.Candidates(); len(got) != 2 {
+		t.Fatalf("a zero epoch produced %v", got)
+	}
+}
+
+func containsRound(rounds []uint32, want uint32) bool {
+	for _, r := range rounds {
+		if r == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestVsetTimesReadsAValidatorSet(t *testing.T) {
@@ -142,7 +187,7 @@ func TestBuildNetworkConfigWithoutAnElection(t *testing.T) {
 	previous := vsetCell(t, prevRound, currRound)
 	current := vsetCell(t, currRound, nextRound)
 
-	outside, err := buildNetworkConfig(nil, previous, current, nil)
+	outside, err := buildNetworkConfig(previous, current, nil)
 	if err != nil {
 		t.Fatalf("an absent config 36 was treated as a failure: %v", err)
 	}
@@ -152,11 +197,11 @@ func TestBuildNetworkConfigWithoutAnElection(t *testing.T) {
 	if outside.NextSince != 0 {
 		t.Fatalf("invented a next validator set: %v", outside.NextSince)
 	}
-	if got := len(outside.Candidates()); got != 3 {
-		t.Fatalf("outside an election there are %d candidate rounds, want 3", got)
+	if !containsRound(outside.Candidates(), currRound) || !containsRound(outside.Candidates(), nextRound) {
+		t.Fatalf("an absent config 36 lost a live round: %v", outside.Candidates())
 	}
 
-	inside, err := buildNetworkConfig(nil, previous, current, vsetCell(t, nextRound, nextRound+65536))
+	inside, err := buildNetworkConfig(previous, current, vsetCell(t, nextRound, nextRound+65536))
 	if err != nil {
 		t.Fatalf("a present config 36 was rejected: %v", err)
 	}
@@ -165,7 +210,7 @@ func TestBuildNetworkConfigWithoutAnElection(t *testing.T) {
 	}
 
 	// The current set is the one thing that must be there.
-	if _, err := buildNetworkConfig(nil, previous, nil, nil); err == nil {
+	if _, err := buildNetworkConfig(previous, nil, nil); err == nil {
 		t.Fatal("a missing current validator set was accepted")
 	}
 }

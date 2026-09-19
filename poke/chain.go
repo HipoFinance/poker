@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -16,7 +17,6 @@ import (
 
 // Network config parameter ids, as config::* in contracts/imports/constants.fc.
 const (
-	configElection           = 15
 	configPreviousValidators = 32
 	configCurrentValidators  = 34
 	configNextValidators     = 36
@@ -134,8 +134,18 @@ type NetworkConfig struct {
 	PreviousSince   uint32
 	PreviousUntil   uint32
 	NextSince       uint32 // zero outside the election window, when config 36 is absent
-	StakeHeldFor    uint32
 }
+
+// blindReach is how many validator epochs before the previous set blind mode still aims at.
+//
+// request_loan lets the treasury hold up to eight participations, and only three of them are
+// named by the validator sets themselves. A round that missed two rotations, or one left in `held`
+// well past its stake_held_until, has a round_since older than config 32 - and those are precisely
+// the incidents this service exists to resolve, so blind mode must not be unable to see them. The
+// extra candidates are stepped back by the epoch length, which is a guess whenever the network's
+// round length has changed, but a wrong guess costs nothing: the external is discarded before
+// accept_message like any other.
+const blindReach = 6
 
 // Candidates is every round_since the treasury could plausibly still be holding, derived from the
 // validator sets alone. This is what blind mode pokes at.
@@ -146,9 +156,24 @@ type NetworkConfig struct {
 // waiting, and config 36 covers the round being elected. Ordered oldest first so that a round that
 // has been waiting longest is poked first.
 func (n NetworkConfig) Candidates() []uint32 {
+	epoch := n.CurrentUntil - n.CurrentSince
+
+	// Oldest first, so a round that has been waiting longest is poked first.
+	var ordered []uint32
+	if epoch > 0 && n.PreviousSince > 0 {
+		for k := blindReach; k >= 1; k-- {
+			step := uint32(k) * epoch
+			if n.PreviousSince <= step {
+				continue // before the chain began; nothing to aim at
+			}
+			ordered = append(ordered, n.PreviousSince-step)
+		}
+	}
+	ordered = append(ordered, n.PreviousSince, n.PreviousUntil, n.CurrentSince, n.CurrentUntil, n.NextSince)
+
 	seen := map[uint32]bool{}
 	var out []uint32
-	for _, v := range []uint32{n.PreviousSince, n.PreviousUntil, n.CurrentSince, n.CurrentUntil, n.NextSince} {
+	for _, v := range ordered {
 		if v == 0 || seen[v] {
 			continue
 		}
@@ -158,21 +183,15 @@ func (n NetworkConfig) Candidates() []uint32 {
 	return out
 }
 
-// NetworkConfig reads the validator sets and the election parameters.
-//
-// It is two calls on purpose. tonutils' GetBlockchainConfig fails the WHOLE request if any
-// requested parameter is absent, and config 36 - the next validator set - exists only during an
-// election window, which is a small part of a round. Asking for it alongside the others left this
-// service unable to read anything at all for most of every round: it logged "config param 36 not
-// found" once a minute and poked nothing. Found by running against mainnet; no unit test over
-// parsed cells could have seen it, which is why the dry-run rehearsal is part of the plan.
 func (s *Session) NetworkConfig(ctx context.Context) (NetworkConfig, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// Always present on a running chain. A failure here is a real failure.
+	// Always present on a running chain. A failure here is a real failure. Only what is actually
+	// used is requested: any absent parameter fails the whole call, so asking for one this
+	// service does not read would be a way to stop poking for no reason.
 	required, err := s.Endpoint.api.GetBlockchainConfig(ctx, s.Block,
-		configElection, configPreviousValidators, configCurrentValidators)
+		configPreviousValidators, configCurrentValidators)
 	if err != nil {
 		return NetworkConfig{}, fmt.Errorf("blockchain config: %w", err)
 	}
@@ -184,7 +203,6 @@ func (s *Session) NetworkConfig(ctx context.Context) (NetworkConfig, error) {
 	}
 
 	return buildNetworkConfig(
-		required.Get(configElection),
 		required.Get(configPreviousValidators),
 		required.Get(configCurrentValidators),
 		next,
@@ -193,7 +211,7 @@ func (s *Session) NetworkConfig(ctx context.Context) (NetworkConfig, error) {
 
 // buildNetworkConfig assembles the config from raw cells, separately from fetching them, so that
 // an absent config 36 can be tested without a chain.
-func buildNetworkConfig(election, previous, current, next *cell.Cell) (NetworkConfig, error) {
+func buildNetworkConfig(previous, current, next *cell.Cell) (NetworkConfig, error) {
 	var n NetworkConfig
 	var err error
 
@@ -220,12 +238,6 @@ func buildNetworkConfig(election, previous, current, next *cell.Cell) (NetworkCo
 			return n, fmt.Errorf("config %d: %w", configNextValidators, err)
 		}
 	}
-	if election != nil {
-		if held, err := stakeHeldFor(election); err == nil {
-			n.StakeHeldFor = held
-		}
-	}
-
 	return n, nil
 }
 
@@ -238,7 +250,11 @@ func vsetTimes(c *cell.Cell) (uint32, uint32, error) {
 	if err != nil {
 		return 0, 0, fmt.Errorf("tag: %w", err)
 	}
-	if tag != 0x12 && tag != 0x11 {
+	// 0x12 only, which is what get_vset_times throws on anything else for
+	// (err::unexpected_validator_set_format in imports/utils.fc). Accepting a shape the contract
+	// rejects would have this service computing deadlines happily for a config the treasury will
+	// not parse, and poking forever at a guard that can never pass.
+	if tag != 0x12 {
 		return 0, 0, fmt.Errorf("unexpected validator set tag 0x%02x", tag)
 	}
 	since, err := s.LoadUInt(32)
@@ -252,21 +268,10 @@ func vsetTimes(c *cell.Cell) (uint32, uint32, error) {
 	return uint32(since), uint32(until), nil
 }
 
-// stakeHeldFor reads the last field of config 15:
-//
-//	_ validators_elected_for:uint32 elections_start_before:uint32
-//	  elections_end_before:uint32 stake_held_for:uint32 = ConfigParam 15;
-func stakeHeldFor(c *cell.Cell) (uint32, error) {
-	s := c.BeginParse()
-	if _, err := s.LoadUInt(32 * 3); err != nil {
-		return 0, err
-	}
-	held, err := s.LoadUInt(32)
-	if err != nil {
-		return 0, err
-	}
-	return uint32(held), nil
-}
+// sendTimeout bounds one endpoint's attempt. Short on purpose: a poke that has not left in five
+// seconds has missed the block it was aimed at, and there is another attempt a second or a minute
+// behind it.
+const sendTimeout = 5 * time.Second
 
 // Send broadcasts one external to every configured endpoint. Every endpoint is used rather than
 // just the session's, because a duplicate external costs nothing - the treasury's guards run
@@ -277,20 +282,35 @@ func stakeHeldFor(c *cell.Cell) (uint32, error) {
 // whether the treasury will accept the message: an external that fails a guard is discarded with
 // no transaction and no receipt. Confirmation is a state re-read, in due.go.
 func (c *Chain) Send(ctx context.Context, body *cell.Cell) error {
-	var lastErr error
-	sent := false
+	// Endpoints in parallel, with a short timeout each. Serially, a single hanging endpoint would
+	// add its full timeout to every poke in the cycle - and blind mode can have two dozen pokes -
+	// which would stretch a sixty-second cycle into minutes and make the service miss the
+	// deadlines it exists to hit. The sends are independent, so there is nothing to order.
+	type result struct{ err error }
+	results := make(chan result, len(c.endpoints))
+
+	var wg sync.WaitGroup
 	for _, ep := range c.endpoints {
-		ectx, cancel := context.WithTimeout(ep.pool.StickyContext(ctx), 10*time.Second)
-		err := ep.api.SendExternalMessage(ectx, &tlb.ExternalMessage{DstAddr: c.treasury, Body: body})
-		cancel()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		sent = true
+		wg.Add(1)
+		go func(ep *Endpoint) {
+			defer wg.Done()
+			ectx, cancel := context.WithTimeout(ep.pool.StickyContext(ctx), sendTimeout)
+			defer cancel()
+			results <- result{ep.api.SendExternalMessage(ectx, &tlb.ExternalMessage{
+				DstAddr: c.treasury,
+				Body:    body,
+			})}
+		}(ep)
 	}
-	if sent {
-		return nil
+	wg.Wait()
+	close(results)
+
+	var lastErr error
+	for r := range results {
+		if r.err == nil {
+			return nil
+		}
+		lastErr = r.err
 	}
 	return lastErr
 }

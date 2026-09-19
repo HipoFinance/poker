@@ -69,12 +69,27 @@ func dueBlind(v View, wall time.Time) []Poke {
 }
 
 func duePrecise(v View) []Poke {
+	return precise(v, v.participateDue)
+}
+
+// DueByContract is what the treasury would accept right now, ignoring this service's own halt
+// policy. Confirmation is measured against this and never against what was sent, so that a change
+// in policy - the governor halting the pool while a poke is outstanding, say - cannot be mistaken
+// for the state having moved.
+func DueByContract(v View) []Poke {
+	if v.Blind {
+		return nil
+	}
+	return precise(v, v.participateLegal)
+}
+
+func precise(v View, participate func(uint32) bool) []Poke {
 	var out []Poke
 	for _, round := range v.Treasury.Rounds() {
 		p := v.Treasury.Participations[round]
 		switch p.State {
 		case StateOpen:
-			if v.participateDue(round) {
+			if participate(round) {
 				out = append(out, Poke{Op: OpParticipateInElection, RoundSince: round})
 			}
 		case StateStaked, StateValidating:
@@ -92,6 +107,11 @@ func duePrecise(v View) []Poke {
 		}
 	}
 	return out
+}
+
+// participateLegal is the contract's guard alone: now() >= min(participate_since, round_since).
+func (v View) participateLegal(round uint32) bool {
+	return v.Now >= participateAt(v.Treasury.Times.ParticipateSince, round)
 }
 
 // participateDue is the treasury's own guard for participate_in_election, plus this service's
@@ -112,7 +132,7 @@ func duePrecise(v View) []Poke {
 // into the elector for a round and a hold, which is the opposite of what halting was for. Waiting
 // for the refund branch resolves the round, returns the collateral and lends nothing.
 func (v View) participateDue(round uint32) bool {
-	if v.Now < participateAt(v.Treasury.Times.ParticipateSince, round) {
+	if !v.participateLegal(round) {
 		return false
 	}
 	if v.Treasury.Stopped {
@@ -216,15 +236,22 @@ type Tracker struct {
 
 func NewTracker() *Tracker { return &Tracker{first: map[Poke]time.Time{}} }
 
-// Observe records the current due set and returns the pokes that have just been confirmed - those
-// that were outstanding and are no longer due, which means the state moved.
-func (t *Tracker) Observe(due []Poke, now time.Time) []Poke {
-	current := make(map[Poke]bool, len(due))
-	for _, p := range due {
-		current[p] = true
+// Observe folds in one cycle. `sent` is what actually left for a liteserver this cycle and is the
+// only thing that starts a clock: a poke nobody managed to send is not evidence that the treasury
+// is refusing anything, and neither is one that a dry run only logged. `dueByContract` is what the
+// treasury would still accept, and anything outstanding that has left it has been confirmed - the
+// state moved, which is the only confirmation an external ever gets.
+//
+// Returns the pokes just confirmed.
+func (t *Tracker) Observe(dueByContract, sent []Poke, now time.Time) []Poke {
+	for _, p := range sent {
 		if _, ok := t.first[p]; !ok {
 			t.first[p] = now
 		}
+	}
+	current := make(map[Poke]bool, len(dueByContract))
+	for _, p := range dueByContract {
+		current[p] = true
 	}
 	var confirmed []Poke
 	for p := range t.first {
@@ -233,20 +260,37 @@ func (t *Tracker) Observe(due []Poke, now time.Time) []Poke {
 			delete(t.first, p)
 		}
 	}
-	sort.Slice(confirmed, func(i, j int) bool {
-		if confirmed[i].RoundSince != confirmed[j].RoundSince {
-			return confirmed[i].RoundSince < confirmed[j].RoundSince
-		}
-		return confirmed[i].Op < confirmed[j].Op
-	})
+	sort.Slice(confirmed, func(i, j int) bool { return lessPoke(confirmed[i], confirmed[j]) })
 	return confirmed
 }
 
-// Reset forgets everything outstanding. Called on entering blind mode: there, every op is due for
-// every candidate on every cycle and nothing ever leaves the due set, so an age tracked across
-// that boundary would grow without bound and report a wedge that is really just a failed read.
-// PokerBlindMode is the signal for that, not PokerPokeUnconfirmed.
+// Reset forgets everything outstanding.
+//
+// It is deliberately NOT called when blind mode is entered or left. It used to be, and that hid
+// wedges: a treasury read failing every few minutes reset every age on each flap, so no poke ever
+// reached the alert threshold while PokerBlindMode's `for` never saw five continuous minutes
+// either, and a genuinely stuck round raised nothing at all. Blind mode now simply publishes no
+// ages - it cannot confirm anything - and the tracker carries across, so an age that was real
+// before the outage is still real after it.
 func (t *Tracker) Reset() { t.first = map[Poke]time.Time{} }
+
+// Newest returns the most recently started poke and how long ago it was first sent. This is what
+// the burst cadence is measured against: "did we send something a moment ago", which is the
+// minimum age, not the maximum.
+func (t *Tracker) Newest(now time.Time) (Poke, time.Duration, bool) {
+	var newest Poke
+	var at time.Time
+	found := false
+	for p, sent := range t.first {
+		if !found || sent.After(at) || (sent.Equal(at) && lessPoke(p, newest)) {
+			newest, at, found = p, sent, true
+		}
+	}
+	if !found {
+		return Poke{}, 0, false
+	}
+	return newest, now.Sub(at), true
+}
 
 // Oldest returns the longest-outstanding poke and how long it has been outstanding.
 func (t *Tracker) Oldest(now time.Time) (Poke, time.Duration, bool) {

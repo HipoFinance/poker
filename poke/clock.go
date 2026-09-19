@@ -26,8 +26,10 @@ const (
 	RetryInterval = time.Minute
 
 	// MaxSleep caps a wait so that a validator-set rotation or a governance change is picked up
-	// within a bounded time even when no deadline is near.
-	MaxSleep = 10 * time.Minute
+	// within a bounded time even when no deadline is near. It is also the floor under how fast a
+	// chain outage can be noticed, because the read clock only advances on a cycle - so
+	// PokerReadFailing's threshold is sized as a multiple of this, and the two move together.
+	MaxSleep = 5 * time.Minute
 )
 
 // Clock converts between the host's clock and the chain's.
@@ -71,31 +73,44 @@ func (c *Clock) Until(deadline uint32) time.Duration {
 
 // NextWait decides how long to sleep before the next cycle, and why.
 //
-//   - While a poke is outstanding and was first sent moments ago, tick every second: this is the
-//     tail of the burst, and it is what turns "the deadline passed" into "the transition landed in
-//     the first block after it".
-//   - While a poke is outstanding but the burst has closed, fall to the plain retry interval.
-//   - With no poke outstanding but a deadline within the lead, tick every second so the burst
-//     opens on time.
-//   - Otherwise sleep until the burst would open, capped.
-func NextWait(pending bool, sinceFirstSend time.Duration, untilDeadline time.Duration, haveDeadline bool) (time.Duration, string) {
-	switch {
-	case pending && sinceFirstSend < BurstTail:
+// It takes the age of the MOST RECENTLY sent poke, not the oldest. That distinction is the whole
+// correctness of this function and it was wrong once: with the oldest age, a single wedged round
+// whose poke had been outstanding for ten minutes pushed every cycle into the plain retry
+// interval, so a second round whose deadline arrived meanwhile got no burst and waited up to a
+// minute. The first-opportunity property switched itself off during exactly the incident it exists
+// for.
+//
+// The rule is that nothing may sleep past something sooner. A just-sent poke wins outright,
+// because one second is already the floor; otherwise an approaching deadline and the retry
+// interval compete and the nearer one wins.
+func NextWait(pending bool, sinceNewestSend time.Duration, untilDeadline time.Duration, haveDeadline bool) (time.Duration, string) {
+	if pending && sinceNewestSend < BurstTail {
+		// The tail of a burst: keep trying every second in case the block that carried the last
+		// attempt was produced a moment before the deadline. Nothing can be sooner than this.
 		return BurstTick, "burst"
-	case pending:
-		return RetryInterval, "retry"
-	case haveDeadline && untilDeadline <= BurstLead:
-		return BurstTick, "deadline is here"
-	case haveDeadline:
-		wait := untilDeadline - BurstLead
-		if wait > MaxSleep {
-			wait = MaxSleep
-		}
-		if wait < BurstTick {
-			wait = BurstTick
-		}
-		return wait, "next deadline"
-	default:
-		return RetryInterval, "idle"
 	}
+
+	wait, reason := RetryInterval, "idle"
+	if pending {
+		reason = "retry"
+	}
+
+	if haveDeadline {
+		toDeadline := untilDeadline - BurstLead
+		if toDeadline < BurstTick {
+			// The deadline is here, or within the lead. Open the burst.
+			toDeadline = BurstTick
+		}
+		if toDeadline > MaxSleep {
+			toDeadline = MaxSleep
+		}
+		// With nothing outstanding, the next deadline is the only thing worth waking for, so it
+		// wins outright and an idle poker sleeps up to MaxSleep. With something outstanding it
+		// only wins when it is sooner than the retry, which is what stops a wedged round from
+		// sleeping through another round's transition.
+		if !pending || toDeadline < wait {
+			wait, reason = toDeadline, "next deadline"
+		}
+	}
+	return wait, reason
 }
