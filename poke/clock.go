@@ -20,6 +20,21 @@ const (
 	// BurstTick is the cadence inside the burst window.
 	BurstTick = time.Second
 
+	// BurstGrace is how long the one-second cadence continues PAST a deadline whose event has
+	// not been observed yet.
+	//
+	// Some deadlines are a clock this service already tracks - stake_held_until, participate_since
+	// - and once they pass the poke is simply due. The validator-set rotation is not: it becomes
+	// due when config 34's hash actually changes, which happens when the masterchain applies the
+	// new set, and that is seconds to a minute after the set's utime_until. Without a grace the
+	// loop bracketed the rotation time itself and then dropped to the 60-second retry at exactly
+	// the moment it should have been watching hardest.
+	//
+	// Observed on mainnet: the rotation landed between 4 and 49 seconds after utime_until across
+	// six rounds. Three minutes is well clear of that, and the window is quiet - nothing is due,
+	// so nothing is sent, and the logs only speak when something changes.
+	BurstGrace = 3 * time.Minute
+
 	// RetryInterval is the plain cadence outside it: no jitter and no backoff. Jitter spreads
 	// load across many independent senders and there are two of these, and duplicate externals
 	// are free for the same reason the burst is.

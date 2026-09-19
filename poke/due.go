@@ -44,6 +44,9 @@ const BlindParticipateWindow = 2 * time.Hour
 // hours in the past, where the margin is satisfied the moment it is tested and nothing waits.
 const refundMargin = 300
 
+// burstGraceSeconds is BurstGrace on the chain's clock, which counts in whole seconds.
+const burstGraceSeconds = uint32(BurstGrace / time.Second)
+
 // View is one cycle's picture of the world.
 type View struct {
 	// Now is the chain's time, corrected. Never the host's.
@@ -239,11 +242,18 @@ func NextDeadline(v View) (uint32, bool) {
 				deadlines = append(deadlines, at)
 			}
 		case StateStaked, StateValidating:
-			// Already due if the set has rotated; otherwise it becomes due at the next rotation,
-			// which is the current set's utime_until.
+			// Already due if the set has rotated; otherwise it becomes due at the next rotation.
+			//
+			// This is the one deadline whose event is observed rather than predicted: the poke
+			// becomes legal when config 34's hash changes, which happens when the masterchain
+			// applies the new set, seconds to a minute after that set's utime_until. So the
+			// deadline is kept for BurstGrace PAST utime_until, which holds the loop on its
+			// one-second cadence until the rotation is actually seen, instead of dropping it to
+			// the 60-second retry at the moment of the rotation. Without this the poker watched
+			// the two seconds before the rotation and then looked away.
 			if v.Network.CurrentVsetHash != nil && p.CurrentVsetHash != nil &&
 				v.Network.CurrentVsetHash.Cmp(p.CurrentVsetHash) == 0 &&
-				v.Network.CurrentUntil > v.Now {
+				v.Network.CurrentUntil+burstGraceSeconds > v.Now {
 				deadlines = append(deadlines, v.Network.CurrentUntil)
 			}
 		case StateHeld:

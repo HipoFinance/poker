@@ -2,7 +2,9 @@ package poke
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -25,7 +27,20 @@ type Poker struct {
 	dryRun  bool
 
 	blind blindState
+
+	// Logging is on change, not on cycle. The loop wakes every five minutes at rest and every
+	// second while it watches a deadline, and repeating an unchanged picture at either rate
+	// buries the lines that matter - a send, a confirmation, entering blind mode - in noise. So
+	// a view is logged when it differs from the last one, and otherwise at a slow heartbeat, so
+	// that silence still means something.
+	lastView   string
+	lastWait   string
+	lastLogged time.Time
 }
+
+// logHeartbeat is how often an unchanged picture is repeated anyway, so that a quiet log is
+// distinguishable from a stopped process.
+const logHeartbeat = 30 * time.Minute
 
 func New(ctx context.Context, o Options) (*Poker, error) {
 	chain, err := NewChain(ctx, o.Treasury, o.OwnServers, o.GlobalConfigURL)
@@ -50,7 +65,10 @@ func (p *Poker) Run(ctx context.Context) {
 		if wait < BurstTick {
 			wait = BurstTick
 		}
-		log.Printf("💤 Next cycle in %v (%v)", wait.Round(time.Millisecond), reason)
+		if line := fmt.Sprintf("💤 Next cycle in %v (%v)", wait.Round(time.Millisecond), reason); line != p.lastWait {
+			p.lastWait = line
+			log.Print(line)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -213,11 +231,32 @@ func (p *Poker) setBlind(readErr error) {
 }
 
 func (p *Poker) logView(view View, due []Poke) {
-	if view.Blind {
-		log.Printf("🙈 Blind for %v, candidate rounds %v, %d pokes due",
-			time.Since(view.BlindSince).Round(time.Second), view.Network.Candidates(), len(due))
+	lines := viewLines(view, due)
+	summary := strings.Join(lines, "\n")
+
+	if summary == p.lastView && time.Since(p.lastLogged) < logHeartbeat {
 		return
 	}
+	p.lastView = summary
+	p.lastLogged = time.Now()
+	for _, line := range lines {
+		log.Print(line)
+	}
+}
+
+func viewLines(view View, due []Poke) []string {
+	if view.Blind {
+		return []string{fmt.Sprintf("🙈 Blind, candidate rounds %v, %d poke(s) due",
+			view.Network.Candidates(), len(due))}
+	}
+
+	var lines []string
+	for _, round := range view.Treasury.Rounds() {
+		part := view.Treasury.Participations[round]
+		lines = append(lines, fmt.Sprintf("ℹ️  Round %v (%v): %v",
+			round, time.Unix(int64(round), 0).Format(TimeFormat), part.State))
+	}
+
 	halted := ""
 	if view.Treasury.Stopped {
 		// Which of the two it is matters more than the halt itself: sending this message to a
@@ -232,11 +271,8 @@ func (p *Poker) logView(view View, due []Poke) {
 			}
 		}
 	}
-	for _, round := range view.Treasury.Rounds() {
-		part := view.Treasury.Participations[round]
-		log.Printf("ℹ️  Round %v (%v): %v", round, time.Unix(int64(round), 0).Format(TimeFormat), part.State)
-	}
-	log.Printf("ℹ️  %d round(s), %d poke(s) due%v", len(view.Treasury.Participations), len(due), halted)
+	return append(lines, fmt.Sprintf("ℹ️  %d round(s), %d poke(s) due%v",
+		len(view.Treasury.Participations), len(due), halted))
 }
 
 // TimeFormat matches the borrower tool's, so the two services' logs read the same way.

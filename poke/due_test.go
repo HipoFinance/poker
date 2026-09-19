@@ -259,3 +259,48 @@ func TestNextDeadline(t *testing.T) {
 		t.Fatalf("a halted treasury scheduled %v (ok=%v), want the refund branch plus its margin at %v", d, ok, want)
 	}
 }
+
+// TestRotationIsWatchedPastItsDeadline replays what happened on mainnet at 2026-09-19T08:59:52Z.
+//
+// A validator-set rotation is the one deadline whose event is observed rather than predicted: the
+// poke becomes legal when config 34's hash changes, and the masterchain applies the new set some
+// seconds after that set's utime_until. The loop used to keep the deadline only while it was in
+// the future, so at the rotation second itself - with the config not yet rotated and therefore
+// nothing due - it dropped to the 60-second retry and looked away. A borrower sent both messages
+// 49 seconds later and the poker woke to find the work already done.
+func TestRotationIsWatchedPastItsDeadline(t *testing.T) {
+	// currRound is validating and the set has not rotated yet, so nothing is due.
+	atRotation := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, nextRound)
+	if got := Due(atRotation, time.Now()); len(got) != 0 {
+		t.Fatalf("something was due before the config rotated: %v", ops(got))
+	}
+
+	// The deadline must survive the moment it names, and for a good while after it.
+	for _, after := range []uint32{0, 1, 30, 49, 120} {
+		v := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, nextRound+after)
+		d, ok := NextDeadline(v)
+		if !ok || d != nextRound {
+			t.Fatalf("%vs past the rotation the loop had no deadline (got %v, ok=%v), so it would "+
+				"sleep for a minute while waiting for a config change", after, d, ok)
+		}
+		wait, _ := NextWait(false, false, 0, time.Duration(int64(d)-int64(v.Now))*time.Second, true)
+		if wait != BurstTick {
+			t.Fatalf("%vs past the rotation the loop waits %v, not the burst cadence", after, wait)
+		}
+	}
+
+	// It must not watch forever, or a chain that stops rotating pins the loop at 1Hz.
+	stale := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, nextRound+burstGraceSeconds+1)
+	if d, ok := NextDeadline(stale); ok {
+		t.Fatalf("the rotation grace never closed: still watching %v", d)
+	}
+
+	// And once the set has actually rotated the poke is due, so there is nothing left to watch.
+	rotated := trustedView(t, currRound, StateValidating, staleHash, 0, false, electionAt, nextRound+10)
+	if got := Due(rotated, time.Now()); !sameOps(got, []Op{OpVsetChanged}) {
+		t.Fatalf("after the rotation, got %v", ops(got))
+	}
+	if d, ok := NextDeadline(rotated); ok {
+		t.Fatalf("a due poke also produced a deadline of %v", d)
+	}
+}
