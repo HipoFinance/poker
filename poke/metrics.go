@@ -2,6 +2,7 @@ package poke
 
 import (
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -61,10 +62,34 @@ var (
 	}, []string{"op"})
 
 	// TreasuryStateFields is the observed get_treasury_state tuple length, so a shape change is
-	// visible here even on the cycles where the guard still passed.
+	// visible here even on the cycles where the guard still passed. It is -1, never 0, until the
+	// get-method has answered once: 0 reads as "the tuple is empty", i.e. as a contract change,
+	// when in fact nothing has been read at all - and the runbook tells an operator to go and
+	// diff the contract on exactly that signal.
 	TreasuryStateFields = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "hipo_poker_treasury_state_fields",
-		Help: "Observed length of the get_treasury_state tuple.",
+		Help: "Observed length of the get_treasury_state tuple; -1 before it has ever answered.",
+	})
+
+	// ReadBlockSeqno is the masterchain block every read in a cycle was pinned to.
+	//
+	// This is the only series that says whether the chain data the poker acts on is CURRENT. A
+	// liteserver that answers promptly from a stale block passes every other check here: reads
+	// succeed, the tuple parses, and its wall clock is right so the offset is zero. Meanwhile the
+	// poker never sees the state move and reports every poke as unconfirmed forever. gauge has
+	// TreasuryStateStale for this and the v4 endpoint has a block-timestamp probe; this service
+	// had nothing.
+	ReadBlockSeqno = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "hipo_poker_read_block_seqno",
+		Help: "Masterchain seqno the last cycle's reads were pinned to.",
+	})
+
+	// DryRun is 1 when the process computes pokes and sends none. Exported because that state is
+	// otherwise indistinguishable from a healthy poker: reads succeed, nothing is outstanding,
+	// every series is green, and the protocol has no driver at all.
+	DryRun = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "hipo_poker_dry_run",
+		Help: "1 when the poker is computing pokes without sending them.",
 	})
 
 	TreasuryStateFieldsExpected = promauto.NewGauge(prometheus.GaugeOpts{
@@ -90,6 +115,14 @@ var (
 		Help: "1 once the chain's clock has been observed at least once.",
 	})
 
+	// LastClockSuccess is when the chain's clock was last actually read. ClockSynced only ever
+	// goes 0 to 1, so without this a GetTime that starts failing after one success leaves the
+	// poker applying a frozen offset indefinitely with every clock series looking healthy.
+	LastClockSuccess = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "hipo_poker_last_clock_success_seconds",
+		Help: "Unix time the chain's clock was last read.",
+	})
+
 	// BlindEntries counts transitions INTO blind mode, which is what makes an intermittently
 	// failing read visible. A read that fails every few minutes never gives PokerBlindMode five
 	// continuous minutes to fire, so without this it raises nothing while being just as broken as
@@ -105,11 +138,22 @@ func init() {
 	TreasuryStateFieldsExpected.Set(treasuryStateMinFields)
 	BlindModeSince.Set(0)
 	ClockSynced.Set(0)
+	LastClockSuccess.Set(float64(time.Now().Unix()))
+	TreasuryStateFields.Set(-1)
+	ReadBlockSeqno.Set(0)
+	DryRun.Set(0)
 }
 
 // published is the label set currently exported by UnconfirmedPoke, so that stale series can be
 // removed one at a time instead of clearing the whole vector.
-var published = map[[2]string]bool{}
+//
+// Package-level while the state it mirrors is per-Poker, and guarded because of it: one Poker per
+// process is the only supported shape, but two in one process would otherwise silently delete
+// each other's series with nothing erroring anywhere.
+var (
+	publishedMu sync.Mutex
+	published   = map[[2]string]bool{}
+)
 
 // PublishOutstanding replaces the unconfirmed-poke series with the current set, so that a
 // confirmed poke's series disappears instead of ageing forever and every alert built on it
@@ -120,6 +164,9 @@ var published = map[[2]string]bool{}
 // on an alert with no `for:` shows up as a resolve followed by a re-fire. The window is tiny and
 // the scrape is every 15 seconds, so it would be rare, confusing and very hard to reproduce.
 func PublishOutstanding(outstanding map[Poke]time.Duration) {
+	publishedMu.Lock()
+	defer publishedMu.Unlock()
+
 	current := make(map[[2]string]bool, len(outstanding))
 	for p, age := range outstanding {
 		labels := [2]string{p.Op.String(), strconv.FormatUint(uint64(p.RoundSince), 10)}

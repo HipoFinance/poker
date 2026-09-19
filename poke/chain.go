@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"sync"
 	"time"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -265,6 +264,12 @@ func vsetTimes(c *cell.Cell) (uint32, uint32, error) {
 	if err != nil {
 		return 0, 0, fmt.Errorf("utime_until: %w", err)
 	}
+	// Ordering is checked because Candidates() subtracts these to get an epoch length. An
+	// inverted pair would underflow uint32 into roughly four billion, pass the `epoch > 0` test,
+	// and have blind mode aiming at invented round numbers.
+	if until <= since {
+		return 0, 0, fmt.Errorf("validator set ends at %d, which is not after it starts at %d", until, since)
+	}
 	return uint32(since), uint32(until), nil
 }
 
@@ -286,31 +291,36 @@ func (c *Chain) Send(ctx context.Context, body *cell.Cell) error {
 	// add its full timeout to every poke in the cycle - and blind mode can have two dozen pokes -
 	// which would stretch a sixty-second cycle into minutes and make the service miss the
 	// deadlines it exists to hit. The sends are independent, so there is nothing to order.
-	type result struct{ err error }
-	results := make(chan result, len(c.endpoints))
+	if len(c.endpoints) == 0 {
+		// Unreachable today - NewChain refuses to build a Chain with none - but this function
+		// must never report a send it did not make. The caller starts a clock on what it returns.
+		return fmt.Errorf("no endpoints configured")
+	}
 
-	var wg sync.WaitGroup
+	results := make(chan error, len(c.endpoints))
 	for _, ep := range c.endpoints {
-		wg.Add(1)
 		go func(ep *Endpoint) {
-			defer wg.Done()
 			ectx, cancel := context.WithTimeout(ep.pool.StickyContext(ctx), sendTimeout)
 			defer cancel()
-			results <- result{ep.api.SendExternalMessage(ectx, &tlb.ExternalMessage{
+			results <- ep.api.SendExternalMessage(ectx, &tlb.ExternalMessage{
 				DstAddr: c.treasury,
 				Body:    body,
-			})}
+			})
 		}(ep)
 	}
-	wg.Wait()
-	close(results)
 
+	// Read as they arrive and return on the first success rather than waiting for all of them.
+	// Waiting made every send take the SLOWEST endpoint's time, so one black-holed endpoint still
+	// added its whole timeout to every poke in a cycle - which is the problem making these
+	// concurrent was supposed to solve, and making them concurrent alone did not. The channel is
+	// buffered to the number of endpoints, so stragglers finish into it and nothing leaks.
 	var lastErr error
-	for r := range results {
-		if r.err == nil {
+	for range c.endpoints {
+		if err := <-results; err == nil {
 			return nil
+		} else {
+			lastErr = err
 		}
-		lastErr = r.err
 	}
 	return lastErr
 }

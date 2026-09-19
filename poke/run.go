@@ -32,6 +32,9 @@ func New(ctx context.Context, o Options) (*Poker, error) {
 	if err != nil {
 		return nil, err
 	}
+	if o.DryRun {
+		DryRun.Set(1)
+	}
 	return &Poker{
 		chain:   chain,
 		clock:   &Clock{},
@@ -71,12 +74,15 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 		return RetryInterval, "no endpoint"
 	}
 
+	ReadBlockSeqno.Set(float64(session.Block.SeqNo))
+
 	if chainNow, err := session.Now(session.Ctx); err != nil {
 		log.Printf("⚠️  Could not read the chain clock: %v", err)
 	} else {
 		p.clock.Observe(chainNow)
 		ClockOffset.Set(float64(p.clock.Offset()))
 		ClockSynced.Set(1)
+		LastClockSuccess.Set(float64(time.Now().Unix()))
 	}
 
 	network, err := session.NetworkConfig(session.Ctx)
@@ -169,8 +175,12 @@ func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration
 	}
 	// The NEWEST, not the oldest: this answers "did we send something a moment ago", and using
 	// the oldest let one wedged round switch off the burst for every other round.
+	// `sent` is threaded through rather than inferred: an empty tracker reports an age of zero,
+	// which NextWait would otherwise read as "sent this instant" and answer with a one-second
+	// cadence, forever.
 	var age time.Duration
-	if _, newest, ok := p.tracker.Newest(wall); ok {
+	_, newest, sent := p.tracker.Newest(wall)
+	if sent {
 		age = newest
 	}
 	deadline, haveDeadline := NextDeadline(view)
@@ -178,7 +188,7 @@ func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration
 	if haveDeadline {
 		until = p.clock.Until(deadline)
 	}
-	return NextWait(pending, age, until, haveDeadline)
+	return NextWait(pending, sent, age, until, haveDeadline)
 }
 
 func (p *Poker) setBlind(readErr error) {

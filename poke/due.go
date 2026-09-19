@@ -16,6 +16,34 @@ import (
 // operator who ignores the warning for two hours gets the conservative behaviour by default.
 const BlindParticipateWindow = 2 * time.Hour
 
+// refundMargin is how far past distribute's own too_late? threshold this service waits before
+// poking a halted treasury's open round.
+//
+// It exists because participate_until is NOT A GUARD, and this service is otherwise built on the
+// assumption that an early send is free. participate_in_election's guards are `state == open` and
+// `now() >= min(participate_since, round_since)`, and both run before accept_message
+// (treasury.fc:883-886). participate_until is read later, inside distribute (treasury.fc:828),
+// after the message has been accepted and the state committed:
+//
+//	int elected?  = ~ config_param(config::next_validators).null?();
+//	int too_late? = now() >= min(participate_until, round_since);
+//	if elected? | too_late? { ...refund... } else { ...decide_loan_requests -> STAKE... }
+//
+// Being early at that line does not throw and cost nobody anything. It takes the other branch and
+// lends. And `now()` there is the gen_utime of whichever block collated the message, which can
+// precede the moment it was sent - which is exactly why the burst starts two seconds early
+// everywhere else. Aimed at this boundary the burst is aimed at the wrong side of it: several
+// copies go to several endpoints and the deciding value is the minimum gen_utime among them, and
+// one early copy is irreversible, because every later copy then throws unable_to_participate.
+//
+// 300 seconds because that is when config 36 appears anyway: participate_until is
+// next_round_since - elections_end_before - 300 (get_times, treasury.fc:649-650) and the next
+// validator set is published at next_round_since - elections_end_before. So for the upcoming
+// round this arm now fires no earlier than the elected? arm, which has no race in either
+// direction. What the arm still buys is the stale open round, whose threshold is round_since and
+// hours in the past, where the margin is satisfied the moment it is tested and nothing waits.
+const refundMargin = 300
+
 // View is one cycle's picture of the world.
 type View struct {
 	// Now is the chain's time, corrected. Never the host's.
@@ -154,7 +182,13 @@ func (v View) refundOnlyFor(round uint32) bool {
 	if v.refundOnly() {
 		return true
 	}
-	return v.Now >= participateAt(v.Treasury.Times.ParticipateUntil, round)
+	return v.Now >= v.refundDeadline(round)
+}
+
+// refundDeadline is the too_late? arm plus its margin - the earliest moment this service will
+// poke a halted treasury's open round.
+func (v View) refundDeadline(round uint32) uint32 {
+	return participateAt(v.Treasury.Times.ParticipateUntil, round) + refundMargin
 }
 
 // refundOnly is the half of that condition which needs no treasury read: once the next validator
@@ -193,11 +227,13 @@ func NextDeadline(v View) (uint32, bool) {
 			}
 			at := participateAt(v.Treasury.Times.ParticipateSince, round)
 			if v.Treasury.Stopped {
-				// Waiting for distribute's refund branch, not the election window. Its other
-				// arm - the next validator set appearing - can arrive earlier than this and
-				// cannot be predicted, so this is an upper bound and the 10-minute sleep cap is
-				// what picks that case up.
-				at = participateAt(v.Treasury.Times.ParticipateUntil, round)
+				// Waiting for distribute's refund branch plus its margin, not for the election
+				// window. The other arm of that branch - the next validator set appearing -
+				// lands at next_round_since - elections_end_before, which is this same moment on
+				// mainnet rather than an earlier one, so this is not an upper bound being
+				// approximated. MaxSleep is what would pick it up if a network ever published
+				// config 36 sooner.
+				at = v.refundDeadline(round)
 			}
 			if at > v.Now {
 				deadlines = append(deadlines, at)

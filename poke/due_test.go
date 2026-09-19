@@ -153,12 +153,25 @@ func TestParticipateIsNotDueEarly(t *testing.T) {
 // the round without lending. So while stopped, participate waits for that branch and settling
 // carries on untouched.
 func TestStoppedDefersParticipateToTheRefundBranch(t *testing.T) {
-	// participate_until is participate_since + 600, so the refund branch opens at electionAt+600.
-	const refundAt = electionAt + 600
+	// participate_until is participate_since + 600, and the service waits refundMargin past it,
+	// because participate_until is a branch inside distribute rather than a guard in front of it.
+	const refundAt = electionAt + 600 + refundMargin
 
 	inWindow := trustedView(t, nextRound, StateOpen, currentHash, 0, true, electionAt, electionAt+1)
 	if got := Due(inWindow, time.Now()); len(got) != 0 {
 		t.Fatalf("a halted treasury was poked inside the election window, which lends: %v", ops(got))
+	}
+
+	// The margin is the whole safety of this path, so it is pinned right at the boundary. A send
+	// one second before distribute's threshold is not free the way an early send is everywhere
+	// else in this service: participate_until is read after accept_message, so early means the
+	// round is STAKED, not that the message is thrown away.
+	for _, early := range []uint32{electionAt + 600 - 1, electionAt + 600, refundAt - 1} {
+		v := trustedView(t, nextRound, StateOpen, currentHash, 0, true, electionAt, early)
+		if got := Due(v, time.Now()); len(got) != 0 {
+			t.Fatalf("a halted treasury was poked at %v, %vs before the refund branch is safe: %v",
+				early, refundAt-early, ops(got))
+		}
 	}
 
 	afterWindow := trustedView(t, nextRound, StateOpen, currentHash, 0, true, electionAt, refundAt)
@@ -241,7 +254,8 @@ func TestNextDeadline(t *testing.T) {
 	// is participate_until rather than participate_since.
 	stopped := trustedView(t, nextRound, StateOpen, currentHash, 0, true, electionAt, testNow)
 	d, ok := NextDeadline(stopped)
-	if !ok || d != electionAt+600 {
-		t.Fatalf("a halted treasury scheduled %v (ok=%v), want the refund branch at %v", d, ok, electionAt+600)
+	want := electionAt + 600 + refundMargin
+	if !ok || d != want {
+		t.Fatalf("a halted treasury scheduled %v (ok=%v), want the refund branch plus its margin at %v", d, ok, want)
 	}
 }

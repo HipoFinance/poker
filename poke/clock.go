@@ -83,8 +83,14 @@ func (c *Clock) Until(deadline uint32) time.Duration {
 // The rule is that nothing may sleep past something sooner. A just-sent poke wins outright,
 // because one second is already the floor; otherwise an approaching deadline and the retry
 // interval compete and the nearer one wins.
-func NextWait(pending bool, sinceNewestSend time.Duration, untilDeadline time.Duration, haveDeadline bool) (time.Duration, string) {
-	if pending && sinceNewestSend < BurstTail {
+//
+// `sent` is separate from `pending` and is not inferable from the age. `pending` means something
+// is due; `sent` means something actually left. Without the distinction an empty tracker reports
+// an age of zero, which reads as "sent this instant" and pins the loop at one second forever -
+// which is the state when every send is failing, or under DRY_RUN, the two situations where a hot
+// loop is least affordable.
+func NextWait(pending, sent bool, sinceNewestSend time.Duration, untilDeadline time.Duration, haveDeadline bool) (time.Duration, string) {
+	if pending && sent && sinceNewestSend < BurstTail {
 		// The tail of a burst: keep trying every second in case the block that carried the last
 		// attempt was produced a moment before the deadline. Nothing can be sooner than this.
 		return BurstTick, "burst"
