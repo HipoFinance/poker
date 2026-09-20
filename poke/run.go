@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -171,11 +172,37 @@ func (p *Poker) send(ctx context.Context, due []Poke) []Poke {
 			continue
 		}
 		body := Body(poke, QueryID(p.clock.Now()))
-		if err := p.chain.Send(ctx, body); err != nil {
+		err := p.chain.Send(ctx, body)
+
+		if reject, ok := asRejection(err); ok {
+			// The treasury refused it, which is the ordinary case and not a fault: the guards
+			// run before accept_message, so a poke aimed a moment early or one whose work another
+			// sender has already done is thrown away at nobody's expense.
+			//
+			// It counts as SENT even so. The message reached a node and was run against the
+			// chain's state, which is what the tracker means by outstanding - so a poke that
+			// keeps being refused keeps ageing towards PokerPokeUnconfirmed, and one refused
+			// because the work is already done drops out of the due set on the next read and is
+			// confirmed. It also keeps the burst cadence, which matters: a poke refused for being
+			// a second early wants retrying in a second, not in a minute.
+			if reject.Expected() {
+				log.Printf("↩️  %v refused: %v", poke, reject.Reason())
+			} else {
+				log.Printf("⚠️  %v refused for an unexpected reason: %v", poke, reject.Reason())
+			}
+			PokesRejected.WithLabelValues(poke.Op.String(), strconv.Itoa(reject.Code)).Inc()
+			sent = append(sent, poke)
+			continue
+		}
+
+		if err != nil {
+			// Nothing reached the chain. This is the one that deserves a warning, and the one
+			// PokerNotSending is counting.
 			log.Printf("⚠️  Failed to send %v: %v", poke, err)
 			PokeErrors.WithLabelValues(poke.Op.String()).Inc()
 			continue
 		}
+
 		// Deliberately not "sent successfully". A liteserver took the bytes; whether the treasury
 		// accepts them is decided by a guard that leaves no receipt either way.
 		log.Printf("📨 Sent %v", poke)

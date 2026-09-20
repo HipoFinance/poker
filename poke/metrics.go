@@ -50,10 +50,24 @@ var (
 		Help: "External messages handed to a liteserver, by op.",
 	}, []string{"op"})
 
+	// PokeErrors counts sends that never reached the chain - a transport failure, not the
+	// treasury refusing the message. That distinction is what PokerNotSending depends on: a
+	// refusal is the ordinary case for this service, and counting it here would have paged about
+	// every round.
 	PokeErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "hipo_poker_poke_errors_total",
-		Help: "Sends that no liteserver accepted, by op.",
+		Help: "Sends that never reached the chain, by op. Excludes messages the treasury refused.",
 	}, []string{"op"})
+
+	// PokesRejected counts messages the treasury ran and refused, by the contract's exit code.
+	// Expected in normal operation - 203 and 205 mean a poke arrived a moment early, 202, 204,
+	// 206 and 207 mean the work was already done by an earlier copy, the other instance or a
+	// borrower - so this is diagnostic and nothing alerts on it. A refusal that persists is
+	// caught by PokerPokeUnconfirmed through the poke's age instead.
+	PokesRejected = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hipo_poker_pokes_rejected_total",
+		Help: "Externals the treasury ran and refused, by op and contract exit code.",
+	}, []string{"op", "code"})
 
 	// Confirmed counts observed state transitions, which is the only evidence a poke worked.
 	Confirmed = promauto.NewCounterVec(prometheus.CounterOpts{
