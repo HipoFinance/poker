@@ -69,6 +69,25 @@ var (
 		Help: "Externals the treasury ran and refused, by op and contract exit code.",
 	}, []string{"op", "code"})
 
+	// PokesDuplicate counts sends a node refused because it already holds the same message.
+	// This is a success wearing a failure's clothes: the two instances build identical bodies on
+	// purpose, so one of them is routinely told the other's copy is already queued. Counted
+	// separately from PokesSent so that a collapse to zero - which would mean the instances have
+	// drifted apart, or that one of them has stopped - stays visible.
+	PokesDuplicate = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hipo_poker_pokes_duplicate_total",
+		Help: "Sends a node already had queued, by op. These are delivered, not failed.",
+	}, []string{"op"})
+
+	// LastTreasuryRead is the unix time of the last trusted read of get_treasury_state, as
+	// opposed to LastReadSuccess, which only says the chain was reachable. The two differ for
+	// exactly the window BlindTransportGrace covers: the treasury read is failing, blind mode has
+	// not started yet, and nothing else says so.
+	LastTreasuryRead = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "hipo_poker_last_treasury_read_seconds",
+		Help: "Unix time of the last trusted get_treasury_state read.",
+	})
+
 	// Confirmed counts observed state transitions, which is the only evidence a poke worked.
 	Confirmed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "hipo_poker_confirmed_transitions_total",
@@ -149,6 +168,7 @@ var (
 
 func init() {
 	LastReadSuccess.Set(float64(time.Now().Unix()))
+	LastTreasuryRead.Set(float64(time.Now().Unix()))
 	TreasuryStateFieldsExpected.Set(treasuryStateMinFields)
 	BlindModeSince.Set(0)
 	ClockSynced.Set(0)

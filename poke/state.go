@@ -2,6 +2,7 @@ package poke
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"sort"
@@ -65,8 +66,31 @@ func (t TreasuryState) Rounds() []uint32 {
 	return out
 }
 
-// ReadTreasury reads and validates the treasury's own view. Any error means blind mode; it never
-// returns a partially trusted state.
+// ShapeError is a treasury state that came back and was not believed: the tuple's length, the
+// type at an index this service reads, or a participation cell did not match what it was written
+// against.
+//
+// It is kept apart from a failure to reach the chain because the two want opposite responses. A
+// shape error is the 2026-09-06 incident recurring - it reads identically from every endpoint and
+// on every retry, so there is nothing to wait for and blind mode has to start at once. A
+// liteserver that cannot answer is usually well again within a minute, and going blind for that
+// fires two dozen externals, takes the halt guard off for two hours and tells nobody the
+// difference.
+type ShapeError struct{ Err error }
+
+func (e ShapeError) Error() string { return e.Err.Error() }
+func (e ShapeError) Unwrap() error { return e.Err }
+
+// IsShapeError reports whether a failed read was the state's shape rather than the chain's
+// availability.
+func IsShapeError(err error) bool {
+	var shape ShapeError
+	return errors.As(err, &shape)
+}
+
+// ReadTreasury reads and validates the treasury's own view. It never returns a partially trusted
+// state: either the whole read is believed, or it is an error, and ShapeError distinguishes the
+// kind of error it is.
 func (s *Session) ReadTreasury(ctx context.Context) (TreasuryState, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -77,7 +101,7 @@ func (s *Session) ReadTreasury(ctx context.Context) (TreasuryState, error) {
 	}
 	ts, err := parseTreasuryState(res.AsTuple())
 	if err != nil {
-		return ts, err
+		return ts, ShapeError{err}
 	}
 
 	timesRes, err := s.Endpoint.api.RunGetMethod(ctx, s.Block, s.Treasury, "get_times")
@@ -86,7 +110,7 @@ func (s *Session) ReadTreasury(ctx context.Context) (TreasuryState, error) {
 	}
 	ts.Times, err = parseTimes(timesRes.AsTuple())
 	if err != nil {
-		return TreasuryState{}, err
+		return TreasuryState{}, ShapeError{err}
 	}
 
 	return ts, nil

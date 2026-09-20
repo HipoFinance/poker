@@ -380,23 +380,65 @@ func lessPoke(a, b Poke) bool {
 type blindState struct {
 	blind bool
 	since time.Time
+
+	// failingSince is when the current run of failed reads began, which is not the same as when
+	// blind mode began: a transport failure has to persist before it counts.
+	failingSince time.Time
 }
+
+// BlindTransportGrace is how long every endpoint must fail to return a treasury state before the
+// service gives up and pokes blind.
+//
+// A shape error waits for nothing, because it will read the same way from every endpoint forever.
+// A liteserver that cannot answer is a different thing entirely, and on 2026-09-20 one of ours
+// answered `CurrentMasterchainInfo` with a block its own shard client had not caught up to yet
+// (`is not in db (possibly out of sync: shard_client_seqno=93898063 ls_seqno=93898106)`). That is
+// a few seconds of lag. Treated as a shape error it put the service into blind mode twice in ten
+// minutes, fired 27 externals each time, and armed the two-hour window in which the halt guard is
+// off - for a node that was fine by the next cycle.
+const BlindTransportGrace = 10 * time.Minute
 
 // Observe folds in one cycle's read result. It reports whether blind mode was entered or left, so
 // the caller logs the transition rather than every cycle.
 func (b *blindState) Observe(readErr error, now time.Time) (entered, left bool) {
-	switch {
-	case readErr != nil && !b.blind:
-		b.blind = true
-		b.since = now
-		return true, false
-	case readErr == nil && b.blind:
-		b.blind = false
-		b.since = time.Time{}
-		return false, true
-	default:
+	if readErr == nil {
+		b.failingSince = time.Time{}
+		if b.blind {
+			b.blind = false
+			b.since = time.Time{}
+			return false, true
+		}
 		return false, false
 	}
+
+	if b.failingSince.IsZero() {
+		b.failingSince = now
+	}
+	if b.blind {
+		return false, false
+	}
+	if !IsShapeError(readErr) && now.Sub(b.failingSince) < BlindTransportGrace {
+		return false, false
+	}
+
+	// `since` is now rather than failingSince: the two-hour participate window measures how long
+	// this service has been poking without sight, not how long the read has been unhappy.
+	b.blind = true
+	b.since = now
+	return true, false
+}
+
+// BlindIn is how much of the grace is left before a failing transport read starts poking blind.
+// Zero once blind mode has started, or when no read is currently failing.
+func (b *blindState) BlindIn(now time.Time) time.Duration {
+	if b.blind || b.failingSince.IsZero() {
+		return 0
+	}
+	left := BlindTransportGrace - now.Sub(b.failingSince)
+	if left < 0 {
+		return 0
+	}
+	return left
 }
 
 func (b *blindState) Blind() bool      { return b.blind }

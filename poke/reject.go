@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/xssnick/tonutils-go/ton"
 )
@@ -30,11 +31,23 @@ type Rejection struct {
 // contract refused it".
 const lsErrNotAccepted = -701
 
+// exitTypeCheck is TVM's type check error, and for these three handlers it has exactly one
+// cause: the round is not in the treasury's dictionary.
+//
+// All three start with `participations.udict_get?(32, round_since)` and hand the result straight
+// to unpack_participation. A miss returns null, unpack_participation loads from it, and the VM
+// throws 7 - before accept_message, like every other refusal here. So 7 means "no such round",
+// and blind mode produces it by design: it aims at every round_since the validator sets suggest,
+// most of which the treasury has never held.
+const exitTypeCheck = 7
+
 var exitCodePattern = regexp.MustCompile(`exitcode=(-?\d+)`)
 
 // treasuryErrors names the exit codes an external can produce, from
 // contracts/imports/constants.fc. A code not listed is reported as its number.
 var treasuryErrors = map[int]string{
+	exitTypeCheck: "round_not_found",
+
 	106: "stopped",
 	107: "invalid_op",
 	201: "not_accepting_loan_requests",
@@ -66,10 +79,19 @@ func (r Rejection) Reason() string {
 // block's gen_utime, which can precede the send. The last three are a poke arriving after the
 // work is already done, by an earlier copy of itself, by the other instance, or by a borrower.
 // Nothing about either is worth waking anyone for.
-func (r Rejection) Expected() bool {
+//
+// round_not_found depends on where the poke came from, which is why blind is a parameter rather
+// than a property of the code. Blind mode guesses round numbers from the validator sets and most
+// of its guesses are wrong by construction, so 7 is its ordinary answer. A sighted cycle pokes
+// only rounds it just read out of the treasury's own dictionary, so 7 there means the round left
+// between the read and the send, or that participations no longer unpack the way this service
+// believes - and the second of those is the failure this whole service was built around.
+func (r Rejection) Expected(blind bool) bool {
 	switch r.Code {
 	case 202, 203, 204, 205, 206, 207:
 		return true
+	case exitTypeCheck:
+		return blind
 	}
 	return false
 }
@@ -88,4 +110,26 @@ func asRejection(err error) (Rejection, bool) {
 		code, _ = strconv.Atoi(m[1])
 	}
 	return Rejection{Code: code}, true
+}
+
+// duplicateText is what a node answers when it already holds this exact external message.
+//
+// It arrives as an LSError with code 0 and no exit code, which is indistinguishable from a real
+// transport failure by shape alone, so it is matched on the text. Nodes key their queue on the
+// message hash and the two instances build identical bodies - same op, same round, and a query id
+// that is the chain's clock in seconds - so whichever sends second is told the first one's copy
+// is already there.
+//
+// That is a success, not a failure: the poke is at a node and will be run. It is also free
+// deduplication, which is why the query id is deliberately left colliding rather than salted per
+// instance. Two instances then cost the network one message instead of two.
+const duplicateText = "duplicate message"
+
+// isDuplicate reports whether the error is a node saying it already has this message queued.
+func isDuplicate(err error) bool {
+	var ls ton.LSError
+	if !errors.As(err, &ls) {
+		return false
+	}
+	return strings.Contains(ls.Text, duplicateText)
 }

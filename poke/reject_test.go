@@ -53,7 +53,7 @@ func TestAsRejectionReadsTheRealRefusals(t *testing.T) {
 			if r.Reason() != tt.reason {
 				t.Fatalf("reason %q, want %q", r.Reason(), tt.reason)
 			}
-			if !r.Expected() {
+			if !r.Expected(false) {
 				t.Fatalf("%v was treated as worth waking someone for", r.Reason())
 			}
 		})
@@ -83,7 +83,7 @@ func TestAsRejectionHandlesUnknownCodes(t *testing.T) {
 	if !ok {
 		t.Fatal("a refusal without an exit code was not recognised as one")
 	}
-	if r.Expected() {
+	if r.Expected(false) || r.Expected(true) {
 		t.Fatal("an unreadable refusal was treated as routine")
 	}
 	if r.Reason() != "no exit code reported" {
@@ -93,10 +93,70 @@ func TestAsRejectionHandlesUnknownCodes(t *testing.T) {
 	// err::stopped is not something these three ops can produce - none of them checks stopped? -
 	// so seeing it would mean the contract has changed under us.
 	stopped, _ := asRejection(lsRefusal("exitcode=106, steps=1, gas_used=0"))
-	if stopped.Expected() {
+	if stopped.Expected(false) || stopped.Expected(true) {
 		t.Fatal("err::stopped from an external was treated as routine")
 	}
 	if stopped.Reason() != "stopped (106)" {
 		t.Fatalf("reason %q", stopped.Reason())
 	}
 }
+
+// The rest of what mainnet produced on 2026-09-20, once the service was made to poke blind. Both
+// of these were logged as faults and neither is one.
+const (
+	refusedUnknownRound = "cannot apply external message to current state : External message was not accepted: " +
+		"cannot run message on account: inbound external message rejected by transaction X:\n" +
+		"exitcode=7, steps=33, gas_used=0\nVM Log (truncated):\nexecute LDU 32\nexecute LDDICT"
+	duplicateSend = "cannot send external message : duplicate message"
+)
+
+// TestRoundNotFoundDependsOnWhetherWeCouldSee. Exit code 7 is the treasury saying it has no such
+// round: all three handlers udict_get the participation and hand the miss straight to
+// unpack_participation, which loads from null. Blind mode produces it by design - its candidates
+// are guesses - but a sighted cycle pokes only rounds it just read, so the same code there means
+// something moved underneath the read, or participations no longer unpack as expected.
+func TestRoundNotFoundDependsOnWhetherWeCouldSee(t *testing.T) {
+	r, ok := asRejection(lsRefusal(refusedUnknownRound))
+	if !ok {
+		t.Fatal("exit code 7 was not read as a refusal")
+	}
+	if r.Code != exitTypeCheck {
+		t.Fatalf("exit code %d, want %d", r.Code, exitTypeCheck)
+	}
+	if r.Reason() != "round_not_found (7)" {
+		t.Fatalf("reason %q", r.Reason())
+	}
+	if !r.Expected(true) {
+		t.Fatal("blind mode was warned about a round it guessed at and the treasury does not hold")
+	}
+	if r.Expected(false) {
+		t.Fatal("a sighted cycle was not warned about a round vanishing between the read and the send")
+	}
+}
+
+// TestDuplicateIsNotAFailure. Both instances build the same body - same op, same round, and a
+// query id that is the chain clock in seconds - so one of them is routinely told the other's copy
+// is already queued. The message is at a node, which is what sending means here.
+func TestDuplicateIsNotAFailure(t *testing.T) {
+	err := ton.LSError{Code: 0, Text: duplicateSend}
+	if !isDuplicate(err) {
+		t.Fatal("a queued duplicate was read as a failure to send")
+	}
+	if _, ok := asRejection(err); ok {
+		t.Fatal("a duplicate was read as the treasury refusing the message")
+	}
+
+	// Everything else at code 0 is a real failure and must keep its warning.
+	for _, other := range []error{
+		ton.LSError{Code: 0, Text: "cannot send external message : too many requests"},
+		errors.New("context deadline exceeded"),
+	} {
+		if isDuplicate(other) {
+			t.Fatalf("%v was read as a duplicate", other)
+		}
+	}
+}
+
+// duplicateErr is the error a node returns when it already holds the message, as the service
+// sees it.
+func duplicateErr() error { return ton.LSError{Code: 0, Text: duplicateSend} }

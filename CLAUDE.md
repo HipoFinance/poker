@@ -25,9 +25,18 @@ facts.
 ## Things that are easy to get wrong here
 
 **Never widen a read into a guess.** `parseTreasuryState` exists to reject, not to parse. If the
-tuple does not match the shape this build was written against, the answer is an error — which
-becomes blind mode — and never a partially trusted value. A getter insert broke the borrower tool
-in 2026-09-06 and cost a round; this service is the thing that is supposed to still work then.
+tuple does not match the shape this build was written against, the answer is a `ShapeError` —
+which becomes blind mode at once — and never a partially trusted value. A getter insert broke the
+borrower tool in 2026-09-06 and cost a round; this service is the thing that is supposed to still
+work then.
+
+**But "I could not read it" is not "I do not believe it".** Everything that is not a `ShapeError`
+is the chain being unavailable, and the two need opposite responses. An unavailable chain is
+retried on the next endpoint (`readAcross` in `poke/run.go`) and then waited out for
+`BlindTransportGrace` before blind mode starts. Collapsing the two is how a liteserver that was
+43 blocks behind for one cycle put the service into blind mode twice in ten minutes on
+2026-09-20 — 27 externals a time, and the halt guard armed off for two hours — while the public
+pool in the same process was healthy throughout.
 
 **`participate_in_election` is the only op with a safety question attached.** Settling ops
 (`vset_changed`, `finish_participation`) run in every mode, always: withholding them strands
@@ -45,6 +54,13 @@ transport failure warns, only a real transport failure counts in
 `hipo_poker_poke_errors_total` (which `PokerNotSending` alerts on — conflating them paged about
 every round), and a refused poke still counts as **sent**, so the burst keeps its cadence and the
 tracker keeps ageing it.
+
+Two more wear a failure's clothes. **Exit code 7** is the treasury having no such round — all
+three handlers `udict_get` the participation and hand a miss to `unpack_participation` — so it is
+blind mode's ordinary answer and a sighted cycle's warning; `Expected` takes the blind flag for
+exactly that reason. **`duplicate message`** is a node saying it already holds this external,
+which is delivery: the two instances build identical bodies on purpose, and the collision is free
+deduplication, so do not salt the query id per instance to make it go away.
 
 **A send is not a confirmation.** An external that fails a guard leaves no transaction and no
 receipt. Anything that reports success on `SendExternalMessage` returning nil is wrong; the

@@ -52,6 +52,16 @@ told apart by the liteserver code, logged as one line naming the guard (`too_soo
 and **counted as sent**: the burst keeps its one-second cadence, because a poke refused for being a
 second early wants retrying in a second, not in a minute.
 
+Two more answers look like failures and are not. Exit code **7** is TVM's type check error and for
+these three handlers it has one cause: all of them `udict_get` the participation and hand a miss
+straight to `unpack_participation`, so 7 means *the treasury has no such round*. Blind mode
+produces it by design, because its candidates are guesses; a sighted cycle pokes only rounds it
+just read, so the same code there is worth a warning. And **`duplicate message`** is a node saying
+it already holds this exact external — the two instances build identical bodies on purpose, so one
+of them is routinely told the other's copy is queued. That is delivery, counted in
+`hipo_poker_pokes_duplicate_total`, and it is free deduplication: two instances cost the network
+one message rather than two.
+
 **A successful send proves nothing.** A liteserver accepting the bytes says only that. A poke is
 treated as outstanding until the state actually stops asking for it, and
 `hipo_poker_unconfirmed_poke_seconds` is the series that says the protocol is not moving.
@@ -59,9 +69,18 @@ treated as outstanding until the state actually stops asking for it, and
 **A bad read degrades to blind, never to wrong.** The participations dictionary is read from a
 positional index of `get_treasury_state`. That index has moved before, and it broke the borrower
 tool. So the tuple's length, the type at every index touched, and the exact consumption of every
-participation cell are all checked before anything is believed; a mismatch is a read failure, and
-a read failure is **blind mode**, which derives candidate rounds from the network config alone and
-fires everything plausible, parsing nothing the treasury returns.
+participation cell are all checked before anything is believed; a mismatch is **blind mode**, which
+derives candidate rounds from the network config alone and fires everything plausible, parsing
+nothing the treasury returns.
+
+**A chain that cannot answer is a different failure, and gets a different answer.** A read is tried
+on every endpoint in turn before it is called failed, because the commonest cause is one node being
+a few blocks behind — it reports a current block its own shard client has not reached, and every
+read at that block returns `is not in db` while the other endpoint is perfectly well. If they all
+fail, the service waits `BlindTransportGrace` before poking blind: blind mode fires two dozen
+externals and suspends the halt guard for two hours, which is far too much to buy with a node that
+will be fine on the next cycle. A shape error waits for nothing, because every endpoint returns the
+same tuple and no amount of retrying will change it.
 
 **It respects a halt without stranding anyone.** `request_loan` checks `stopped?`, so a halted pool
 can gain no new requests — an open round then holds only bids placed before the halt, whose
@@ -104,8 +123,10 @@ one of the cases this service exists to survive.
 
 `hipo_poker_last_read_success_seconds`, `hipo_poker_read_block_seqno`, `hipo_poker_blind_mode`,
 `hipo_poker_blind_mode_since_seconds`, `hipo_poker_blind_entries_total`,
+`hipo_poker_last_treasury_read_seconds`,
 `hipo_poker_unconfirmed_poke_seconds{op,round_since}`, `hipo_poker_pokes_sent_total{op}`,
-`hipo_poker_pokes_rejected_total{op,code}`, `hipo_poker_poke_errors_total{op}`,
+`hipo_poker_pokes_rejected_total{op,code}`, `hipo_poker_pokes_duplicate_total{op}`,
+`hipo_poker_poke_errors_total{op}`,
 `hipo_poker_confirmed_transitions_total{op}`, `hipo_poker_treasury_state_fields`,
 `hipo_poker_treasury_state_fields_expected`, `hipo_poker_clock_offset_seconds`,
 `hipo_poker_clock_synced`, `hipo_poker_last_clock_success_seconds`, `hipo_poker_dry_run`.

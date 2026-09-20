@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -78,10 +79,85 @@ func (p *Poker) Run(ctx context.Context) {
 	}
 }
 
+// reading is one cycle's view of the chain: one endpoint, one masterchain block, and everything
+// read at it. err is the treasury read's failure, if any; the rest is still usable when it is set,
+// which is what blind mode runs on.
+type reading struct {
+	session  *Session
+	network  NetworkConfig
+	treasury TreasuryState
+	err      error
+}
+
+// read returns the first endpoint that could answer, trying them in configured order.
+//
+// The retry is over the whole reading rather than the one failing call, because a Session pins a
+// masterchain block and the usual reason an endpoint fails a read at that block is that it does
+// not have it yet. On 2026-09-20 one of our own liteservers reported a current block its own
+// shard client was 43 behind, and every read against that block came back `is not in db`. Asking
+// the same endpoint again would have failed identically; asking the next one, at the block IT is
+// on, succeeds. Before this, a lagging node of ours put the service straight into blind mode
+// while a healthy public pool sat unused in the same process.
+func (p *Poker) read(ctx context.Context) (reading, error) {
+	return readAcross(ctx, p.chain.Endpoints(), p.readFrom)
+}
+
+// readFrom is one endpoint's whole read. It returns an error only when the endpoint gave nothing
+// usable at all; a reading whose `err` is set still carries the validator sets, which is what
+// blind mode runs on.
+func (p *Poker) readFrom(ctx context.Context, ep *Endpoint) (reading, error) {
+	session, err := p.chain.SessionOn(ctx, ep)
+	if err != nil {
+		return reading{}, err
+	}
+	network, err := session.NetworkConfig(session.Ctx)
+	if err != nil {
+		return reading{}, err
+	}
+	treasury, readErr := session.ReadTreasury(session.Ctx)
+	return reading{session: session, network: network, treasury: treasury, err: readErr}, nil
+}
+
+// readAcross walks the endpoints in order and takes the first usable answer.
+//
+// A ShapeError ends the search instead of continuing it: every endpoint returns the same tuple,
+// so there is nothing to look for elsewhere, and that failure is the one blind mode was built
+// for. A transport failure keeps looking, but the first endpoint that at least gave the validator
+// sets is kept, so that a total failure of the treasury read still leaves blind mode something to
+// aim at.
+func readAcross(ctx context.Context, endpoints []*Endpoint,
+	step func(context.Context, *Endpoint) (reading, error)) (reading, error) {
+
+	var lastErr error
+	var partial *reading
+
+	for _, ep := range endpoints {
+		r, err := step(ctx, ep)
+		if err != nil {
+			lastErr = fmt.Errorf("%v: %w", ep.Name, err)
+			log.Printf("⚠️  endpoint %v did not answer: %v", ep.Name, err)
+			continue
+		}
+		if r.err == nil || IsShapeError(r.err) {
+			return r, nil
+		}
+		if partial == nil {
+			partial = &r
+		}
+		lastErr = fmt.Errorf("%v: %w", ep.Name, r.err)
+	}
+
+	if partial != nil {
+		partial.err = lastErr
+		return *partial, nil
+	}
+	return reading{}, lastErr
+}
+
 // Cycle is one read-decide-send pass. It never returns an error: every failure has a defined
 // degraded behaviour, and a poke service that exits on a bad read is worse than useless.
 func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
-	session, err := p.chain.Session(ctx)
+	r, err := p.read(ctx)
 	if err != nil {
 		// Nothing was observed this cycle, so nothing may be claimed. Leaving the last ages
 		// published would freeze them at whatever they were: a poke that happened to be one
@@ -89,9 +165,10 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 		// outage, with a description about the treasury refusing a message nobody could send.
 		// PokerReadFailing is the alert for this.
 		PublishOutstanding(nil)
-		log.Printf("❌ No liteserver answered: %v", err)
+		log.Printf("❌ No endpoint could be read: %v", err)
 		return RetryInterval, "no endpoint"
 	}
+	session, network, treasury, readErr := r.session, r.network, r.treasury, r.err
 
 	ReadBlockSeqno.Set(float64(session.Block.SeqNo))
 
@@ -104,22 +181,11 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 		LastClockSuccess.Set(float64(time.Now().Unix()))
 	}
 
-	network, err := session.NetworkConfig(session.Ctx)
-	if err != nil {
-		// Without the validator sets there are no candidate rounds and no rotation time, so not
-		// even blind mode has anything to aim at. This is "cannot reach the chain", which is a
-		// different failure from "cannot trust the treasury" and is reported by
-		// hipo_poker_last_read_success_seconds ageing rather than by blind mode.
-		PublishOutstanding(nil)
-		log.Printf("❌ Could not read the network config: %v", err)
-		return RetryInterval, "no network config"
-	}
-
-	// Everything below this line is reachable even when the treasury cannot be read, so the read
-	// clock advances here.
+	// The chain was reachable and the validator sets were read, which is what this series means.
+	// Whether the treasury itself could be read is a different question, answered by
+	// LastTreasuryRead below and by blind mode.
 	LastReadSuccess.Set(float64(time.Now().Unix()))
 
-	treasury, readErr := session.ReadTreasury(session.Ctx)
 	// Published whenever a tuple came back at all, including when it was then rejected - a shape
 	// change is exactly the case where an operator needs to see the observed length, and
 	// PokerBlindMode's runbook entry tells them to compare it against the expected one.
@@ -127,7 +193,20 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	if treasury.Fields > 0 {
 		TreasuryStateFields.Set(float64(treasury.Fields))
 	}
+	if readErr == nil {
+		LastTreasuryRead.Set(float64(time.Now().Unix()))
+	}
 	p.setBlind(readErr)
+
+	// A treasury read that has failed, but not for long enough to justify poking blind. Nothing
+	// is known about any round this cycle, so nothing is poked and nothing is claimed; the grace
+	// exists because the usual cause clears within a cycle or two.
+	if readErr != nil && !p.blind.Blind() {
+		PublishOutstanding(nil)
+		log.Printf("⚠️  Could not read the treasury state, retrying (blind in %v): %v",
+			p.blind.BlindIn(time.Now()).Round(time.Second), readErr)
+		return RetryInterval, "treasury unreadable"
+	}
 
 	wall := time.Now()
 	view := View{
@@ -145,7 +224,7 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	// accepted, or one a dry run merely logged, is not evidence that the treasury is refusing
 	// anything, and treating it as such pages someone for a broken network path with a message
 	// about a wedged round.
-	sent := p.send(ctx, due)
+	sent := p.send(ctx, due, view.Blind)
 
 	// Confirmation is measured against what the treasury would still accept, never against what
 	// this service chose to send, so a halt taking effect mid-window cannot be mistaken for a
@@ -164,8 +243,23 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	return p.schedule(view, wall, len(due) > 0)
 }
 
-func (p *Poker) send(ctx context.Context, due []Poke) []Poke {
+func (p *Poker) send(ctx context.Context, due []Poke, blind bool) []Poke {
 	var sent []Poke
+
+	// Blind mode's ordinary outcomes are collapsed into one line. Its candidate rounds are
+	// guesses stepped back from the validator sets, so most of them are rounds the treasury has
+	// never held and answer round_not_found; a cycle produces two dozen such lines and buries the
+	// one that matters. A sighted cycle pokes only rounds it just read, at most a handful, and
+	// every outcome there is worth its own line.
+	routine := map[string]int{}
+	report := func(reason, line string) {
+		if blind {
+			routine[reason]++
+			return
+		}
+		log.Print(line)
+	}
+
 	for _, poke := range due {
 		if p.dryRun {
 			log.Printf("🧪 Would send %v", poke)
@@ -173,6 +267,18 @@ func (p *Poker) send(ctx context.Context, due []Poke) []Poke {
 		}
 		body := Body(poke, QueryID(p.clock.Now()))
 		err := p.chain.Send(ctx, body)
+
+		if isDuplicate(err) {
+			// The message is at a node already, put there by the other instance or by an earlier
+			// attempt in the same second. That is delivery, so it counts as sent for every
+			// purpose: the burst keeps its cadence and the poke keeps ageing until the state
+			// moves. Counting it as a failure is what made a whole blind cycle look like a total
+			// outage in the log while every message was in fact on its way.
+			report("already queued", fmt.Sprintf("👯 %v was already queued at a node", poke))
+			PokesDuplicate.WithLabelValues(poke.Op.String()).Inc()
+			sent = append(sent, poke)
+			continue
+		}
 
 		if reject, ok := asRejection(err); ok {
 			// The treasury refused it, which is the ordinary case and not a fault: the guards
@@ -185,8 +291,8 @@ func (p *Poker) send(ctx context.Context, due []Poke) []Poke {
 			// because the work is already done drops out of the due set on the next read and is
 			// confirmed. It also keeps the burst cadence, which matters: a poke refused for being
 			// a second early wants retrying in a second, not in a minute.
-			if reject.Expected() {
-				log.Printf("↩️  %v refused: %v", poke, reject.Reason())
+			if reject.Expected(blind) {
+				report(reject.Reason(), fmt.Sprintf("↩️  %v refused: %v", poke, reject.Reason()))
 			} else {
 				log.Printf("⚠️  %v refused for an unexpected reason: %v", poke, reject.Reason())
 			}
@@ -209,7 +315,33 @@ func (p *Poker) send(ctx context.Context, due []Poke) []Poke {
 		PokesSent.WithLabelValues(poke.Op.String()).Inc()
 		sent = append(sent, poke)
 	}
+
+	if len(routine) > 0 {
+		log.Printf("🙈 Blind cycle: %v", summarise(routine))
+	}
 	return sent
+}
+
+// summarise renders the collapsed blind-mode outcomes, commonest first and alphabetically within
+// a count, so that consecutive cycles produce the same line when nothing has changed - which is
+// what logView's on-change suppression needs to be able to stay quiet.
+func summarise(counts map[string]int) string {
+	reasons := make([]string, 0, len(counts))
+	for reason := range counts {
+		reasons = append(reasons, reason)
+	}
+	sort.Slice(reasons, func(i, j int) bool {
+		if counts[reasons[i]] != counts[reasons[j]] {
+			return counts[reasons[i]] > counts[reasons[j]]
+		}
+		return reasons[i] < reasons[j]
+	})
+
+	parts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		parts = append(parts, fmt.Sprintf("%v ×%d", reason, counts[reason]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration, string) {

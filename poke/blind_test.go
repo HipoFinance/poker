@@ -249,7 +249,7 @@ func TestBlindSinceIsSetOnce(t *testing.T) {
 		t.Fatal("a successful read on a healthy latch reported a transition")
 	}
 
-	entered, _ := b.Observe(errors.New("tuple is the wrong shape"), start)
+	entered, _ := b.Observe(ShapeError{errors.New("tuple is the wrong shape")}, start)
 	if !entered || !b.Blind() {
 		t.Fatal("a failed read did not enter blind mode")
 	}
@@ -259,7 +259,7 @@ func TestBlindSinceIsSetOnce(t *testing.T) {
 
 	// Every subsequent failure, including ones hours later, must leave the clock alone.
 	for _, after := range []time.Duration{time.Minute, time.Hour, 3 * time.Hour} {
-		entered, left := b.Observe(errors.New("still wrong"), start.Add(after))
+		entered, left := b.Observe(ShapeError{errors.New("still wrong")}, start.Add(after))
 		if entered || left {
 			t.Fatalf("a repeat failure after %v reported a transition", after)
 		}
@@ -278,7 +278,7 @@ func TestBlindSinceIsSetOnce(t *testing.T) {
 	}
 
 	later := start.Add(5 * time.Hour)
-	b.Observe(errors.New("again"), later)
+	b.Observe(ShapeError{errors.New("again")}, later)
 	if !b.Since().Equal(later) {
 		t.Fatalf("a second outage inherited the first one's clock: %v, want %v", b.Since(), later)
 	}
@@ -310,5 +310,81 @@ func TestBlindPastTheWindowStillRetiresOpenRounds(t *testing.T) {
 	// And the settling ops are never withheld, in any mode.
 	if !hasOp(got, OpVsetChanged) || !hasOp(got, OpFinishParticipation) {
 		t.Fatalf("blind mode stopped settling: %v", got)
+	}
+}
+
+// TestATransientReadFailureDoesNotGoBlind. Blind mode fires every op at every candidate round and
+// takes the halt guard off for two hours; a liteserver that is a few blocks behind for one cycle
+// must not buy all that.
+//
+// This is what 2026-09-20 looked like: one of our own nodes answered with a current block its
+// shard client had not reached, the read failed, and the service went blind twice in ten minutes
+// while a healthy public pool sat in the same process.
+func TestATransientReadFailureDoesNotGoBlind(t *testing.T) {
+	var b blindState
+	start := time.Now()
+	lagging := errors.New("get_treasury_state: lite server error, code 651: cannot load block ... is not in db")
+
+	if entered, _ := b.Observe(lagging, start); entered {
+		t.Fatal("one failed read went blind; a node a few blocks behind is not a shape change")
+	}
+	if b.Blind() {
+		t.Fatal("blind on the first transport failure")
+	}
+	if got := b.BlindIn(start); got != BlindTransportGrace {
+		t.Fatalf("grace left %v, want %v", got, BlindTransportGrace)
+	}
+
+	// The read comes back a cycle later, as it did on the day. The grace has to reset, or a node
+	// that hiccups once a minute eventually accumulates its way into blind mode.
+	if _, left := b.Observe(nil, start.Add(time.Minute)); left {
+		t.Fatal("a recovery reported leaving blind mode without ever having been in it")
+	}
+	if got := b.BlindIn(start.Add(time.Minute)); got != 0 {
+		t.Fatalf("a recovered read left %v of grace still running", got)
+	}
+	if entered, _ := b.Observe(lagging, start.Add(2*time.Minute)); entered {
+		t.Fatal("the second hiccup inherited the first one's grace")
+	}
+}
+
+// But a transport failure that never clears must still go blind, or the service quietly stops
+// driving the protocol for as long as the liteservers are unhappy - which is the whole case it
+// exists for.
+func TestASustainedReadFailureGoesBlindEventually(t *testing.T) {
+	var b blindState
+	start := time.Now()
+	down := errors.New("get_treasury_state: context deadline exceeded")
+
+	b.Observe(down, start)
+	if entered, _ := b.Observe(down, start.Add(BlindTransportGrace-time.Second)); entered {
+		t.Fatal("blind mode started before the grace was up")
+	}
+
+	at := start.Add(BlindTransportGrace)
+	entered, _ := b.Observe(down, at)
+	if !entered || !b.Blind() {
+		t.Fatal("a read failing for the whole grace period never went blind")
+	}
+	// The window measures time spent poking blind, not time spent failing to read, so it starts
+	// here rather than at the first failure.
+	if !b.Since().Equal(at) {
+		t.Fatalf("blind since %v, want %v", b.Since(), at)
+	}
+	if got := b.BlindIn(at); got != 0 {
+		t.Fatalf("grace still counting down at %v after blind mode started", got)
+	}
+}
+
+// A shape error waits for nothing. It reads the same from every endpoint and on every retry, and
+// it is the 2026-09-06 incident recurring: the tuple moved and every positional reader broke.
+func TestAShapeErrorGoesBlindImmediately(t *testing.T) {
+	var b blindState
+	start := time.Now()
+	if entered, _ := b.Observe(ShapeError{errors.New("26 fields, want 28")}, start); !entered {
+		t.Fatal("a shape change waited out the transport grace")
+	}
+	if !b.Since().Equal(start) {
+		t.Fatalf("blind since %v, want %v", b.Since(), start)
 	}
 }

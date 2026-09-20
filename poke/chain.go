@@ -92,25 +92,38 @@ func NewChain(ctx context.Context, treasury *address.Address, ownServers []LiteS
 	return c, nil
 }
 
+// Endpoints returns the endpoints in configured order, so a caller can retry a whole read on the
+// next one. A read is not retried inside a session: the session pins a block, and the reason an
+// endpoint fails a read is usually that it does not have that block yet.
+func (c *Chain) Endpoints() []*Endpoint { return c.endpoints }
+
+// SessionOn pins a cycle to one endpoint and the masterchain block that endpoint is currently on.
+func (c *Chain) SessionOn(ctx context.Context, ep *Endpoint) (*Session, error) {
+	sctx, cancel := context.WithTimeout(ep.pool.StickyContext(ctx), 10*time.Second)
+	defer cancel()
+	block, err := ep.api.CurrentMasterchainInfo(sctx)
+	if err != nil {
+		return nil, err
+	}
+	return &Session{
+		Endpoint: ep,
+		Ctx:      ep.pool.StickyContext(ctx),
+		Block:    block,
+		Treasury: c.treasury,
+	}, nil
+}
+
 // Session takes the first endpoint that answers, in configured order.
 func (c *Chain) Session(ctx context.Context) (*Session, error) {
 	var lastErr error
 	for _, ep := range c.endpoints {
-		sctx, cancel := context.WithTimeout(ep.pool.StickyContext(ctx), 10*time.Second)
-		block, err := ep.api.CurrentMasterchainInfo(sctx)
+		session, err := c.SessionOn(ctx, ep)
 		if err != nil {
-			cancel()
 			lastErr = err
 			log.Printf("⚠️  endpoint %v did not answer: %v", ep.Name, err)
 			continue
 		}
-		cancel()
-		return &Session{
-			Endpoint: ep,
-			Ctx:      ep.pool.StickyContext(ctx),
-			Block:    block,
-			Treasury: c.treasury,
-		}, nil
+		return session, nil
 	}
 	return nil, fmt.Errorf("no endpoint answered: %w", lastErr)
 }
@@ -314,13 +327,31 @@ func (c *Chain) Send(ctx context.Context, body *cell.Cell) error {
 	// added its whole timeout to every poke in a cycle - which is the problem making these
 	// concurrent was supposed to solve, and making them concurrent alone did not. The channel is
 	// buffered to the number of endpoints, so stragglers finish into it and nothing leaks.
-	var lastErr error
+	failures := make([]error, 0, len(c.endpoints))
 	for range c.endpoints {
-		if err := <-results; err == nil {
+		err := <-results
+		if err == nil {
 			return nil
-		} else {
-			lastErr = err
 		}
+		failures = append(failures, err)
+	}
+	return chooseFailure(failures)
+}
+
+// chooseFailure picks which failure to report when no endpoint accepted the message outright.
+//
+// A duplicate wins over anything else. It is the most informative answer available - the message
+// is already queued at a node, so the poke has in fact left - and without this preference one slow
+// endpoint's timeout, arriving later on the channel, overwrites it and the caller counts a
+// delivered poke as a failure to send. That miscount switches off the one-second burst, which is
+// how a poke that was one second early came to wait a full minute for its retry.
+func chooseFailure(failures []error) error {
+	var lastErr error
+	for _, err := range failures {
+		if isDuplicate(err) {
+			return err
+		}
+		lastErr = err
 	}
 	return lastErr
 }
