@@ -38,6 +38,14 @@ policy is built on that distinction, not on withholding — see `participateDue`
 Do not collapse those branches, and do not "fix" the stopped case by skipping the message: that
 strands the collateral of borrowers who bid before the halt.
 
+**A refusal is not a failure.** The treasury throwing before `accept_message` is what this
+service is built on, and it surfaces as a liteserver error that looks like a transport failure.
+`asRejection` in `poke/reject.go` separates them, and three things hang off that: only a real
+transport failure warns, only a real transport failure counts in
+`hipo_poker_poke_errors_total` (which `PokerNotSending` alerts on — conflating them paged about
+every round), and a refused poke still counts as **sent**, so the burst keeps its cadence and the
+tracker keeps ageing it.
+
 **A send is not a confirmation.** An external that fails a guard leaves no transaction and no
 receipt. Anything that reports success on `SendExternalMessage` returning nil is wrong; the
 `Tracker` and the state re-read are how a transition is established. Two rules keep that series

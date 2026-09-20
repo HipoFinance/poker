@@ -44,6 +44,14 @@ host clock a few seconds fast would fire early on every round forever.
 mistimed external is discarded in the compute phase with no transaction committed and nobody
 charged. That is what makes the burst, two instances and duplicate borrower pokes all cost nothing.
 
+A consequence worth stating, because it is easy to get wrong: **a refused external is the ordinary
+case, not a fault.** It arrives looking like a transport error — the node reports that it could not
+apply the message — but it means the message *did* reach the chain and was run. So refusals are
+told apart by the liteserver code, logged as one line naming the guard (`too_soon_to_participate`,
+`vset_not_changed`, …), counted in `hipo_poker_pokes_rejected_total` rather than the error counter,
+and **counted as sent**: the burst keeps its one-second cadence, because a poke refused for being a
+second early wants retrying in a second, not in a minute.
+
 **A successful send proves nothing.** A liteserver accepting the bytes says only that. A poke is
 treated as outstanding until the state actually stops asking for it, and
 `hipo_poker_unconfirmed_poke_seconds` is the series that says the protocol is not moving.
