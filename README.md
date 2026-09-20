@@ -102,12 +102,13 @@ one of the cases this service exists to survive.
 
 ## Metrics
 
-`hipo_poker_last_read_success_seconds`, `hipo_poker_blind_mode`,
+`hipo_poker_last_read_success_seconds`, `hipo_poker_read_block_seqno`, `hipo_poker_blind_mode`,
 `hipo_poker_blind_mode_since_seconds`, `hipo_poker_blind_entries_total`,
 `hipo_poker_unconfirmed_poke_seconds{op,round_since}`, `hipo_poker_pokes_sent_total{op}`,
-`hipo_poker_poke_errors_total{op}`, `hipo_poker_confirmed_transitions_total{op}`,
-`hipo_poker_treasury_state_fields`, `hipo_poker_treasury_state_fields_expected`,
-`hipo_poker_clock_offset_seconds`, `hipo_poker_clock_synced`.
+`hipo_poker_pokes_rejected_total{op,code}`, `hipo_poker_poke_errors_total{op}`,
+`hipo_poker_confirmed_transitions_total{op}`, `hipo_poker_treasury_state_fields`,
+`hipo_poker_treasury_state_fields_expected`, `hipo_poker_clock_offset_seconds`,
+`hipo_poker_clock_synced`, `hipo_poker_last_clock_success_seconds`, `hipo_poker_dry_run`.
 
 `hipo_poker_unconfirmed_poke_seconds` counts only pokes that actually left for a liteserver, and a
 poke is confirmed when the *treasury* would no longer accept it — not when this service stops
@@ -124,7 +125,7 @@ publisher of the same fact would only create a way for the two to disagree.
 make test   # go build, go vet, go test
 ```
 
-The tests need no chain access. Alerting rules and the deployment live in
-[`HipoFinance/operation`](https://github.com/HipoFinance/operation) (`stack/poker.yaml`,
-`monitor/rules/poker-alerting-rule.yaml`); the design is
-`contract/docs/specs/2026-09-18-poke-service.md`.
+The tests need no chain access, and the design is written up in
+[the spec](https://github.com/HipoFinance/contract/blob/main/docs/specs/2026-09-18-poke-service.md).
+The deployment and its alerting rules live in Hipo's ops repo, which is private; the metrics above
+are everything they are built on, so a rule set equivalent to ours can be written from this page.
