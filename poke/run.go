@@ -125,6 +125,12 @@ func (p *Poker) readFrom(ctx context.Context, ep *Endpoint) (reading, error) {
 // for. A transport failure keeps looking, but the first endpoint that at least gave the validator
 // sets is kept, so that a total failure of the treasury read still leaves blind mode something to
 // aim at.
+//
+// tonutils-go's own WithRetry does not cover this, which is worth knowing because it looks as
+// though it should: it retries code 651, the exact error a lagging node returns, but it does so
+// with StickyContextNextNode, which moves to the next node WITHIN one pool. Our own-node pool
+// holds a single liteserver, so there is no next node and the retrier gives up at once. The
+// fallback that matters here is between pools, and only this loop does it.
 func readAcross(ctx context.Context, endpoints []*Endpoint,
 	step func(context.Context, *Endpoint) (reading, error)) (reading, error) {
 
