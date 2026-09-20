@@ -205,7 +205,7 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 		PublishOutstanding(nil)
 		log.Printf("⚠️  Could not read the treasury state, retrying (blind in %v): %v",
 			p.blind.BlindIn(time.Now()).Round(time.Second), readErr)
-		return RetryInterval, "treasury unreadable"
+		return waitWhileUnreadable(p.clock.Until(network.CurrentUntil)), "treasury unreadable"
 	}
 
 	wall := time.Now()
@@ -342,6 +342,30 @@ func summarise(counts map[string]int) string {
 		parts = append(parts, fmt.Sprintf("%v ×%d", reason, counts[reason]))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// waitWhileUnreadable is the sleep for a cycle that could not read the treasury: the plain retry,
+// except that it will not sleep through a validator-set rotation.
+//
+// Nothing is known about any round without the participations dictionary, so there is no deadline
+// to aim at - with one exception, and it is the one that costs the most to miss. The rotation is
+// read from config 34, which is still readable, and it is the moment vset_changed becomes legal
+// for every validating round. Sleeping a flat minute through it would hand back the lateness the
+// burst exists to remove, for a read that may well succeed by then. So the cycle lands just
+// before the rotation and retries at the burst tick across it; a second or two either side, then
+// back to the minute.
+func waitWhileUnreadable(untilRotation time.Duration) time.Duration {
+	wait := RetryInterval
+	if untilRotation <= 0 {
+		return wait
+	}
+	if toDeadline := untilRotation - BurstLead; toDeadline < wait {
+		if toDeadline < BurstTick {
+			toDeadline = BurstTick
+		}
+		wait = toDeadline
+	}
+	return wait
 }
 
 func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration, string) {

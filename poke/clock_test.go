@@ -208,3 +208,33 @@ func TestNextWaitDoesNotSpinOnAnEmptyTracker(t *testing.T) {
 		t.Fatalf("a genuinely just-sent poke lost the burst: %v", wait)
 	}
 }
+
+// TestWaitWhileUnreadableDoesNotSleepThroughARotation. A cycle that could not read the treasury
+// knows nothing about any round - except when the next validator set rotates, which comes from
+// config 34 and is still readable. That is when vset_changed becomes legal for every validating
+// round, and sleeping a flat minute through it gives back exactly the lateness the burst exists
+// to remove.
+func TestWaitWhileUnreadableDoesNotSleepThroughARotation(t *testing.T) {
+	tests := []struct {
+		name          string
+		untilRotation time.Duration
+		want          time.Duration
+	}{
+		{"nowhere near a rotation", 40 * time.Minute, RetryInterval},
+		{"a rotation just past the retry", RetryInterval + 10*time.Second, RetryInterval},
+		{"ten seconds out", 10 * time.Second, 10*time.Second - BurstLead},
+		{"one second out, do not overshoot it", time.Second, BurstTick},
+		{"the rotation is now", 0, RetryInterval},
+		{"the rotation has passed", -5 * time.Minute, RetryInterval},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := waitWhileUnreadable(tt.untilRotation); got != tt.want {
+				t.Fatalf("wait %v, want %v", got, tt.want)
+			}
+			if got := waitWhileUnreadable(tt.untilRotation); got < BurstTick {
+				t.Fatalf("wait %v would spin the loop", got)
+			}
+		})
+	}
+}
