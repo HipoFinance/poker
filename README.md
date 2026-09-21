@@ -35,8 +35,11 @@ box.
 ## How it behaves
 
 **It pokes at the first opportunity.** Each transition has a computable moment at which it becomes
-legal, so the loop sleeps until that moment rather than polling towards it, and opens a one-second
-burst from two seconds before until three after. Deadlines are measured on the **chain's** clock,
+legal, so the loop sleeps until that moment rather than polling towards it, and opens a burst
+around it — one-second sleeps from two seconds before until three after the last send. Measured on
+mainnet that works out at about **two seconds per attempt**, because each cycle re-reads the chain
+before deciding and that read costs roughly a second; a poke rejected for being early is accepted
+on the next attempt, two seconds later. Deadlines are measured on the **chain's** clock,
 read from a liteserver, because the treasury's guards compare against a block's `gen_utime` and a
 host clock a few seconds fast would fire early on every round forever.
 
@@ -49,8 +52,11 @@ case, not a fault.** It arrives looking like a transport error — the node repo
 apply the message — but it means the message *did* reach the chain and was run. So refusals are
 told apart by the liteserver code, logged as one line naming the guard (`too_soon_to_participate`,
 `vset_not_changed`, …), counted in `hipo_poker_pokes_rejected_total` rather than the error counter,
-and **counted as sent**: the burst keeps its one-second cadence, because a poke refused for being a
-second early wants retrying in a second, not in a minute.
+and **counted as sent**: the burst keeps its cadence, because a poke refused for being a second
+early wants retrying at once, not in a minute. That is not theoretical — on 2026-09-20 at 18:52:52
+`participate_in_election` was refused with `too_soon_to_participate` and accepted at 18:52:54.
+Counted as a failure, as it was before, it would have waited until 18:53:52 and a borrower would
+have got there first.
 
 Two more answers look like failures and are not. Exit code **7** is TVM's type check error and for
 these three handlers it has one cause: all of them `udict_get` the participation and hand a miss

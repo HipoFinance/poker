@@ -69,11 +69,17 @@ var (
 		Help: "Externals the treasury ran and refused, by op and contract exit code.",
 	}, []string{"op", "code"})
 
-	// PokesDuplicate counts sends a node refused because it already holds the same message.
-	// This is a success wearing a failure's clothes: the two instances build identical bodies on
-	// purpose, so one of them is routinely told the other's copy is already queued. Counted
-	// separately from PokesSent so that a collapse to zero - which would mean the instances have
-	// drifted apart, or that one of them has stopped - stays visible.
+	// PokesDuplicate counts sends every endpoint refused because it already holds the same
+	// message. This is a success wearing a failure's clothes: the two instances build identical
+	// bodies on purpose, so one can be told the other's copy is already queued.
+	//
+	// Expect it to sit at ZERO in normal operation, and do not read that as a fault. Send fans
+	// out to every endpoint and returns on the first success, so a duplicate is only reported
+	// when EVERY endpoint had already seen that exact message - which needs the other instance to
+	// have reached all of them within the same second, since the query id is the chain clock in
+	// seconds. The instances wake independently, so they rarely collide. What does raise it is
+	// blind mode, where both fire the same two dozen candidates on the same one-minute cadence.
+	// The first full day on mainnet (2026-09-20) recorded none outside the blind-mode incident.
 	PokesDuplicate = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "hipo_poker_pokes_duplicate_total",
 		Help: "Sends a node already had queued, by op. These are delivered, not failed.",
