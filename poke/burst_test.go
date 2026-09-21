@@ -66,8 +66,17 @@ func TestBurstKeepsItsCadenceAndStops(t *testing.T) {
 	p, f := newPoker(refusal(203))
 	poke := Poke{Op: OpParticipateInElection, RoundSince: nextRound}
 
+	// In a goroutine with a hard bound: a burst whose window never closes would otherwise hang
+	// the suite until the whole test binary times out, which reads as a broken CI job rather
+	// than as this assertion.
 	start := time.Now()
-	p.burst(context.Background(), []Poke{poke})
+	done := make(chan struct{})
+	go func() { p.burst(context.Background(), []Poke{poke}); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(BurstTail + 5*BurstTick):
+		t.Fatal("the burst never closed its window; it would send until the process stopped")
+	}
 	elapsed := time.Since(start)
 
 	if elapsed < BurstTail || elapsed > BurstTail+2*BurstTick {
