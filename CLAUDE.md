@@ -55,6 +55,14 @@ transport failure warns, only a real transport failure counts in
 every round), and a refused poke still counts as **sent**, so the burst keeps its cadence and the
 tracker keeps ageing it.
 
+**`Expected` and `Settled` are different questions over the same codes, and they disagree.**
+`Expected` decides whether to warn a human; `Settled` decides whether the burst stops re-sending,
+which matters because the burst reads nothing between attempts and has only the exit code to go
+on. 206 is expected and unsettled — `vset_changed` throws `vset_not_changed` both *before* a
+rotation and *after* a successful one, since the handler packs `new_vset_hash` back into the
+participation, so it cannot mean "done" on its own. An unknown code is unexpected and settled, so
+meeting something new stops the loop rather than feeding it. Do not collapse the two predicates.
+
 Two more wear a failure's clothes. **Exit code 7** is the treasury having no such round — all
 three handlers `udict_get` the participation and hand a miss to `unpack_participation` — so it is
 blind mode's ordinary answer and a sighted cycle's warning; `Expected` takes the blind flag for

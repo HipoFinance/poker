@@ -36,10 +36,11 @@ box.
 
 **It pokes at the first opportunity.** Each transition has a computable moment at which it becomes
 legal, so the loop sleeps until that moment rather than polling towards it, and opens a burst
-around it — one-second sleeps from two seconds before until three after the last send. Measured on
-mainnet that works out at about **two seconds per attempt**, because each cycle re-reads the chain
-before deciding and that read costs roughly a second; a poke rejected for being early is accepted
-on the next attempt, two seconds later. Deadlines are measured on the **chain's** clock,
+around it: awake one tick before, then **re-sending once a second for ten seconds without reading
+anything in between**. Re-reading is what used to make that cadence two seconds rather than one —
+a cycle is six liteserver round trips — and the set has already been decided, so the burst just
+sends it again and lets the contract's guards filter. Deadlines are measured on the **chain's**
+clock,
 read from a liteserver, because the treasury's guards compare against a block's `gen_utime` and a
 host clock a few seconds fast would fire early on every round forever.
 
@@ -57,6 +58,15 @@ early wants retrying at once, not in a minute. That is not theoretical — on 20
 `participate_in_election` was refused with `too_soon_to_participate` and accepted at 18:52:54.
 Counted as a failure, as it was before, it would have waited until 18:53:52 and a borrower would
 have got there first.
+
+Since the burst reads nothing between attempts, the exit code is all it has to reason with, and
+`Settled` asks a different question of it than `Expected` does: *should this stop being retried*
+rather than *should this warn a human*. They disagree on both interesting codes. **206 is expected
+and never settles** — `vset_changed` throws `vset_not_changed` both before a rotation and after a
+successful one, because the handler packs the new hash back into the participation, so the code
+cannot be read as "done" without a read; retrying a finished round costs a discarded external,
+while dropping an unfinished one costs a minute. **An unrecognised code is unexpected and settles**,
+so a build that meets something new stops and lets the next full cycle look at the chain.
 
 Two more answers look like failures and are not. Exit code **7** is TVM's type check error and for
 these three handlers it has one cause: all of them `udict_get` the participation and hand a miss
