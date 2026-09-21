@@ -283,7 +283,7 @@ func TestRotationIsWatchedPastItsDeadline(t *testing.T) {
 			t.Fatalf("%vs past the rotation the loop had no deadline (got %v, ok=%v), so it would "+
 				"sleep for a minute while waiting for a config change", after, d, ok)
 		}
-		wait, _ := NextWait(false, false, 0, time.Duration(int64(d)-int64(v.Now))*time.Second, true)
+		wait, _ := NextWait(false, time.Duration(int64(d)-int64(v.Now))*time.Second, true)
 		if wait != BurstTick {
 			t.Fatalf("%vs past the rotation the loop waits %v, not the burst cadence", after, wait)
 		}

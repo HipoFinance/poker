@@ -96,6 +96,37 @@ func (r Rejection) Expected(blind bool) bool {
 	return false
 }
 
+// Settled reports whether this refusal ends the burst for that poke - that is, whether the
+// treasury has said something that means there is no point sending it again without reading.
+//
+// It is a different question from Expected, over the same codes, and they disagree. Expected asks
+// whether to warn a human; Settled asks whether to stop retrying. 206 is expected and NOT settled;
+// an unreadable code is unexpected and IS settled.
+//
+// Only three codes keep a poke in the burst, and the logic is inverted deliberately so that an
+// unrecognised code stops rather than loops:
+//
+//   - 203 too_soon_to_participate and 205 too_soon_to_finish_participation are a guard comparing
+//     against a block's gen_utime that has not reached the deadline yet. Another second may be
+//     all it needs. This is the case the burst exists for.
+//   - 206 vset_not_changed is ambiguous and cannot be resolved without a read. vset_changed throws
+//     it on `new_vset_hash != current_vset_hash` failing, which happens BEFORE the rotation, when
+//     the stored hash still matches the config - and equally AFTER a successful vset_changed,
+//     because the handler packs new_vset_hash back into the participation. Same code, opposite
+//     meanings. So the burst keeps going: retrying a round that is already done costs a discarded
+//     external, and dropping one that is not costs a minute.
+//
+// Everything else settles. 202, 204 and 207 are a state that has moved past this op, 7 is a round
+// the treasury does not hold, and a code this service does not recognise is a reason to stop and
+// let the next full cycle look at the chain rather than to keep firing blind.
+func (r Rejection) Settled() bool {
+	switch r.Code {
+	case 203, 205, 206:
+		return false
+	}
+	return true
+}
+
 // asRejection reports whether an error is the treasury refusing the message rather than a failure
 // to reach the chain at all. The distinction decides three things: whether it is logged as a
 // warning, whether it counts as a send failure, and whether the poke counts as having left - a

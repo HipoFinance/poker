@@ -320,6 +320,14 @@ func (t *Tracker) Observe(dueByContract, sent []Poke, now time.Time) []Poke {
 // before the outage is still real after it.
 func (t *Tracker) Reset() { t.first = map[Poke]time.Time{} }
 
+// Known reports whether this poke has ever left for a liteserver. It is how a cycle tells a
+// deadline that has only just arrived from a round that has been retried for ten minutes, which
+// decides whether to open a burst.
+func (t *Tracker) Known(p Poke) bool {
+	_, ok := t.first[p]
+	return ok
+}
+
 // Newest returns the most recently started poke and how long ago it was first sent. This is what
 // the burst cadence is measured against: "did we send something a moment ago", which is the
 // minimum age, not the maximum.

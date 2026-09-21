@@ -36,26 +36,19 @@ func TestClockCorrectsTheHost(t *testing.T) {
 	}
 }
 
-// TestNextWait pins the cadence: the burst around a deadline, and the plain minute outside it.
+// TestNextWait pins the cadence between cycles: sleep to the next deadline, or the plain minute.
+// The burst itself is no longer a sleep - it runs inside one cycle - and lives in burst_test.go.
 func TestNextWait(t *testing.T) {
 	tests := []struct {
-		name           string
-		pending        bool
-		sent           bool
-		sinceFirstSend time.Duration
-		untilDeadline  time.Duration
-		haveDeadline   bool
-		want           time.Duration
+		name          string
+		pending       bool
+		untilDeadline time.Duration
+		haveDeadline  bool
+		want          time.Duration
 	}{
 		{
-			name: "just sent, stay on the burst cadence",
-			// The poke went out at the deadline; keep trying every second in case the block that
-			// carried it was produced a moment early.
-			pending: true, sent: true, sinceFirstSend: time.Second, want: BurstTick,
-		},
-		{
-			name:    "the burst has closed, fall back to the minute",
-			pending: true, sent: true, sinceFirstSend: BurstTail + time.Second, want: RetryInterval,
+			name:    "something outstanding and no deadline known",
+			pending: true, want: RetryInterval,
 		},
 		{
 			name:          "a deadline inside the lead opens the burst",
@@ -81,13 +74,13 @@ func TestNextWait(t *testing.T) {
 			name: "an outstanding poke outranks an approaching deadline",
 			// Otherwise the loop would sleep towards the next transition while the current one is
 			// still unacknowledged.
-			pending: true, sent: true, sinceFirstSend: 10 * time.Minute,
+			pending:       true,
 			untilDeadline: 2 * time.Hour, haveDeadline: true, want: RetryInterval,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, reason := NextWait(tt.pending, tt.sent, tt.sinceFirstSend, tt.untilDeadline, tt.haveDeadline)
+			got, reason := NextWait(tt.pending, tt.untilDeadline, tt.haveDeadline)
 			if got != tt.want {
 				t.Fatalf("got %v (%v), want %v", got, reason, tt.want)
 			}
@@ -95,36 +88,27 @@ func TestNextWait(t *testing.T) {
 	}
 }
 
-// The burst is only worth its noise if it actually brackets the deadline. Walking a clock through
-// it second by second is what proves the loop is awake on both sides.
-//
-// NextDeadline only ever reports a deadline still in the future, so once the moment passes the
-// loop is driven by the now-outstanding poke rather than by a deadline. The fixture models that.
-func TestBurstBracketsTheDeadline(t *testing.T) {
+// The lead half of the burst is NextWait's job: the loop has to be awake at the tick before the
+// deadline arrives, not discover it a minute late. The tail half runs inside a cycle and is
+// covered by TestBurstKeepsItsCadenceAndStops.
+func TestTheLoopIsAwakeGoingIntoTheDeadline(t *testing.T) {
 	var c Clock
 	base := time.Now().Unix()
 	c.Observe(uint32(base))
 	deadline := uint32(base + 30)
 
-	awakeAt := map[int64]bool{}
-	for offset := int64(-5); offset <= 5; offset++ {
+	for offset := int64(-5); offset <= 0; offset++ {
 		c.Observe(uint32(base + 30 + offset))
-		pending := offset >= 0 // the poke becomes due at the deadline and is sent from then on
-		var since time.Duration
-		if pending {
-			since = time.Duration(offset) * time.Second
+		wait, reason := NextWait(false, c.Until(deadline), true)
+		if offset >= -int64(BurstLead/time.Second) {
+			if wait != BurstTick {
+				t.Fatalf("at deadline%+d the loop slept %v (%v), not the tick", offset, wait, reason)
+			}
+			continue
 		}
-		wait, _ := NextWait(pending, pending, since, c.Until(deadline), !pending)
-		awakeAt[offset] = wait == BurstTick
-	}
-
-	for offset := int64(-2); offset <= 2; offset++ {
-		if !awakeAt[offset] {
-			t.Fatalf("the loop was not on the burst cadence at deadline%+d", offset)
+		if wait > time.Duration(-offset)*time.Second {
+			t.Fatalf("at deadline%+d the loop slept %v (%v), past the deadline", offset, wait, reason)
 		}
-	}
-	if awakeAt[5] {
-		t.Fatal("the burst never closed")
 	}
 }
 
@@ -134,78 +118,20 @@ func TestBurstBracketsTheDeadline(t *testing.T) {
 func TestNextWaitDoesNotSleepPastASecondTransition(t *testing.T) {
 	// A poke outstanding for ten minutes - the state PokerPokeUnconfirmed fires on - and another
 	// round's transition twenty seconds out.
-	wait, reason := NextWait(true, true, 10*time.Minute, 20*time.Second, true)
+	wait, reason := NextWait(true, 20*time.Second, true)
 	if wait != 20*time.Second-BurstLead {
 		t.Fatalf("with a wedged round pending, a deadline %v away produced a %v sleep (%v); "+
 			"the second transition would wait for the retry interval", 20*time.Second, wait, reason)
 	}
 
 	// The same, with the deadline already inside the lead.
-	if wait, _ := NextWait(true, true, 10*time.Minute, time.Second, true); wait != BurstTick {
+	if wait, _ := NextWait(true, time.Second, true); wait != BurstTick {
 		t.Fatalf("an imminent deadline did not open the burst while a poke was outstanding: %v", wait)
 	}
 
-	// And the burst tail still wins outright: nothing is sooner than one second.
-	if wait, _ := NextWait(true, true, time.Second, 20*time.Second, true); wait != BurstTick {
-		t.Fatalf("a just-sent poke left the burst cadence: %v", wait)
-	}
-
 	// A far deadline must not drag a pending retry out to MaxSleep.
-	if wait, r := NextWait(true, true, 10*time.Minute, 4*time.Hour, true); wait != RetryInterval {
+	if wait, r := NextWait(true, 4*time.Hour, true); wait != RetryInterval {
 		t.Fatalf("a pending poke waited %v (%v), want the retry interval", wait, r)
-	}
-}
-
-// TestScheduleUsesTheNewestSend covers the bug at its real site.
-//
-// NextWait had the right rule and `schedule` handed it the wrong number: the oldest outstanding
-// age rather than the newest. A unit test on NextWait alone passed throughout, which is why this
-// one exists at the wiring instead.
-func TestScheduleUsesTheNewestSend(t *testing.T) {
-	p := &Poker{clock: &Clock{}, tracker: NewTracker()}
-	p.clock.Observe(testNow)
-	wall := time.Now()
-
-	// A round wedged for ten minutes, exactly the state PokerPokeUnconfirmed fires on.
-	wedged := Poke{Op: OpParticipateInElection, RoundSince: nextRound}
-	p.tracker.Observe([]Poke{wedged}, []Poke{wedged}, wall.Add(-10*time.Minute))
-
-	// Meanwhile another round's stake_held_until is twenty seconds away.
-	v := trustedView(t, prevRound, StateHeld, currentHash, testNow+20, false, electionAt, testNow)
-
-	wait, reason := p.schedule(v, wall, true)
-	if wait > 20*time.Second {
-		t.Fatalf("slept %v (%v) past a transition %v away, because another round is wedged",
-			wait, reason, 20*time.Second)
-	}
-
-	// And the burst tail: a second poke sent THIS cycle, alongside the wedged one. The newest age
-	// is zero and the cadence must be one second; the oldest age is ten minutes and would put the
-	// loop on the plain retry, losing the burst for the round that just became due.
-	fresh := Poke{Op: OpFinishParticipation, RoundSince: prevRound}
-	p.tracker.Observe([]Poke{wedged, fresh}, []Poke{fresh}, wall)
-	if wait, reason := p.schedule(v, wall, true); wait != BurstTick {
-		t.Fatalf("a poke sent this cycle did not hold the burst cadence: %v (%v); "+
-			"the oldest outstanding poke is being used instead of the newest", wait, reason)
-	}
-}
-
-// TestNextWaitDoesNotSpinOnAnEmptyTracker. An empty tracker reports an age of zero, and zero is
-// indistinguishable from "sent this instant" unless the caller says whether anything was sent at
-// all. Without that the loop pins itself at one second forever in the two states where a hot loop
-// is least affordable: every send failing, and DRY_RUN - neither of which records a send, so
-// neither of which ever ages out of the burst.
-func TestNextWaitDoesNotSpinOnAnEmptyTracker(t *testing.T) {
-	if wait, reason := NextWait(true, false, 0, 0, false); wait != RetryInterval {
-		t.Fatalf("with nothing sent the loop waits %v (%v); it would re-read the chain every second",
-			wait, reason)
-	}
-	if wait, _ := NextWait(true, false, 0, 4*time.Hour, true); wait != RetryInterval {
-		t.Fatalf("with nothing sent and a distant deadline the loop waited %v", wait)
-	}
-	// And the burst still works for a poke that really was sent this instant.
-	if wait, _ := NextWait(true, true, 0, 0, false); wait != BurstTick {
-		t.Fatalf("a genuinely just-sent poke lost the burst: %v", wait)
 	}
 }
 

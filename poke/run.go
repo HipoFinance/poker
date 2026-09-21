@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/xssnick/tonutils-go/address"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 )
 
 type Options struct {
@@ -23,7 +24,10 @@ type Options struct {
 }
 
 type Poker struct {
-	chain   *Chain
+	chain *Chain
+	// sender is the chain narrowed to the one call a send needs, so that the burst - which is
+	// nothing but sends - can be tested without a liteserver.
+	sender  sender
 	clock   *Clock
 	tracker *Tracker
 	dryRun  bool
@@ -54,6 +58,7 @@ func New(ctx context.Context, o Options) (*Poker, error) {
 	}
 	return &Poker{
 		chain:   chain,
+		sender:  chain,
 		clock:   &Clock{},
 		tracker: NewTracker(),
 		dryRun:  o.DryRun,
@@ -77,6 +82,11 @@ func (p *Poker) Run(ctx context.Context) {
 		case <-time.After(wait):
 		}
 	}
+}
+
+// sender is what a send needs of the chain: one call that puts a body in front of every endpoint.
+type sender interface {
+	Send(ctx context.Context, body *cell.Cell) error
 }
 
 // reading is one cycle's view of the chain: one endpoint, one masterchain block, and everything
@@ -230,7 +240,35 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	// accepted, or one a dry run merely logged, is not evidence that the treasury is refusing
 	// anything, and treating it as such pages someone for a broken network path with a message
 	// about a wedged round.
-	sent := p.send(ctx, due, view.Blind)
+	//
+	// Blind mode collapses its ordinary outcomes into one line: its candidate rounds are guesses
+	// stepped back from the validator sets, so most of them are rounds the treasury has never
+	// held and answer round_not_found, and two dozen such lines a cycle bury the one that
+	// matters. A sighted cycle pokes only rounds it just read, and every outcome there is worth
+	// its own line.
+	routine := map[string]int{}
+	report := func(reason, line string) {
+		if view.Blind {
+			routine[reason]++
+			return
+		}
+		log.Print(line)
+	}
+
+	burstWanted := p.shouldBurstBefore(view, due)
+	sent, unsettled := p.attempt(ctx, due, report)
+	if len(routine) > 0 {
+		log.Printf("🙈 Blind cycle: %v", summarise(routine))
+	}
+
+	// The burst re-sends without reading, so it runs before anything is observed and its sends
+	// join this cycle's. Ages are measured from `wall`, the moment before the first attempt, so a
+	// burst does not make a poke look younger than it is.
+	bursted := false
+	if burstWanted && len(sent) > 0 {
+		bursted = true
+		sent = append(sent, p.burst(ctx, unsettled)...)
+	}
 
 	// Confirmation is measured against what the treasury would still accept, never against what
 	// this service chose to send, so a halt taking effect mid-window cannot be mistaken for a
@@ -241,38 +279,34 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 			log.Printf("✅ %v confirmed: the state moved", c)
 			Confirmed.WithLabelValues(c.Op.String()).Inc()
 		}
-		PublishOutstanding(p.tracker.Outstanding(wall))
+		// Published against the clock now rather than against `wall`, which a burst leaves up to
+		// BurstTail behind.
+		PublishOutstanding(p.tracker.Outstanding(time.Now()))
 	} else {
 		PublishOutstanding(nil)
 	}
 
-	return p.schedule(view, wall, len(due) > 0)
+	if bursted {
+		// A burst sends without reading, so nothing it did has been confirmed yet. The next cycle
+		// is that read, and it is worth having at once rather than a minute later.
+		return BurstTick, "confirming the burst"
+	}
+	return p.schedule(view, len(due) > 0)
 }
 
-func (p *Poker) send(ctx context.Context, due []Poke, blind bool) []Poke {
-	var sent []Poke
-
-	// Blind mode's ordinary outcomes are collapsed into one line. Its candidate rounds are
-	// guesses stepped back from the validator sets, so most of them are rounds the treasury has
-	// never held and answer round_not_found; a cycle produces two dozen such lines and buries the
-	// one that matters. A sighted cycle pokes only rounds it just read, at most a handful, and
-	// every outcome there is worth its own line.
-	routine := map[string]int{}
-	report := func(reason, line string) {
-		if blind {
-			routine[reason]++
-			return
-		}
-		log.Print(line)
-	}
-
+// attempt sends each poke once. It reports what actually left for a liteserver, and which pokes
+// are still worth sending again without reading anything first.
+//
+// `report` decides what the ordinary outcomes look like in the log; warnings always go straight
+// out, because the codes that produce them all settle, so each can appear at most once per poke.
+func (p *Poker) attempt(ctx context.Context, due []Poke, report func(reason, line string)) (sent, unsettled []Poke) {
 	for _, poke := range due {
 		if p.dryRun {
 			log.Printf("🧪 Would send %v", poke)
 			continue
 		}
 		body := Body(poke, QueryID(p.clock.Now()))
-		err := p.chain.Send(ctx, body)
+		err := p.sender.Send(ctx, body)
 
 		if isDuplicate(err) {
 			// The message is at a node already, put there by the other instance or by an earlier
@@ -280,9 +314,14 @@ func (p *Poker) send(ctx context.Context, due []Poke, blind bool) []Poke {
 			// purpose: the burst keeps its cadence and the poke keeps ageing until the state
 			// moves. Counting it as a failure is what made a whole blind cycle look like a total
 			// outage in the log while every message was in fact on its way.
+			//
+			// Still unsettled: a node holding the bytes says nothing about the treasury running
+			// them, and the next attempt carries a new query id anyway, since the id is the
+			// chain clock in seconds.
 			report("already queued", fmt.Sprintf("👯 %v was already queued at a node", poke))
 			PokesDuplicate.WithLabelValues(poke.Op.String()).Inc()
 			sent = append(sent, poke)
+			unsettled = append(unsettled, poke)
 			continue
 		}
 
@@ -295,37 +334,105 @@ func (p *Poker) send(ctx context.Context, due []Poke, blind bool) []Poke {
 			// chain's state, which is what the tracker means by outstanding - so a poke that
 			// keeps being refused keeps ageing towards PokerPokeUnconfirmed, and one refused
 			// because the work is already done drops out of the due set on the next read and is
-			// confirmed. It also keeps the burst cadence, which matters: a poke refused for being
-			// a second early wants retrying in a second, not in a minute.
-			if reject.Expected(blind) {
+			// confirmed. It also keeps the burst going, which matters: a poke refused for being a
+			// second early wants retrying in a second, not in a minute.
+			if reject.Expected(p.blind.Blind()) {
 				report(reject.Reason(), fmt.Sprintf("↩️  %v refused: %v", poke, reject.Reason()))
 			} else {
 				log.Printf("⚠️  %v refused for an unexpected reason: %v", poke, reject.Reason())
 			}
 			PokesRejected.WithLabelValues(poke.Op.String(), strconv.Itoa(reject.Code)).Inc()
 			sent = append(sent, poke)
+			if !reject.Settled() {
+				unsettled = append(unsettled, poke)
+			}
 			continue
 		}
 
 		if err != nil {
 			// Nothing reached the chain. This is the one that deserves a warning, and the one
-			// PokerNotSending is counting.
+			// PokerNotSending is counting. It settles: re-sending into a path that just failed,
+			// every second, is not a use of the burst, and the next full cycle will try again
+			// with a fresh read and a fresh choice of endpoint.
 			log.Printf("⚠️  Failed to send %v: %v", poke, err)
 			PokeErrors.WithLabelValues(poke.Op.String()).Inc()
 			continue
 		}
 
 		// Deliberately not "sent successfully". A liteserver took the bytes; whether the treasury
-		// accepts them is decided by a guard that leaves no receipt either way.
+		// accepts them is decided by a guard that leaves no receipt either way - which is also
+		// why this poke stays unsettled and gets sent again.
 		log.Printf("📨 Sent %v", poke)
 		PokesSent.WithLabelValues(poke.Op.String()).Inc()
 		sent = append(sent, poke)
+		unsettled = append(unsettled, poke)
+	}
+	return sent, unsettled
+}
+
+// burst re-sends the pokes that are still wanted, one second apart, reading nothing in between.
+//
+// This is the change that made the cadence match what it claimed. An attempt used to be a whole
+// cycle - masterchain info, chain clock, config 32/34, config 36, get_treasury_state, get_times -
+// six round trips and about a second, so a "one second" burst ran at two. Re-sending a set already
+// decided on needs none of that, and over-poking is free because every guard runs before
+// accept_message.
+//
+// What it gives up is that it acts on a read that is up to BurstTail old. The consequence worth
+// naming is the halt: participate_in_election is chosen from the state at the top of the cycle, so
+// a halt landing mid-burst is invisible and distribute lends. That widens a window that already
+// existed - the read always precedes the send - from about a second to about eleven, and is
+// accepted because set_stopped does not stop a round being lent in any case: the op is
+// unauthenticated and has no stopped? check, so anyone may do it. See
+// contract/docs/specs/2026-09-21-burst-without-rereading.md.
+func (p *Poker) burst(ctx context.Context, unsettled []Poke) []Poke {
+	// From now, not from the last attempt: a poke refused every second must not be able to keep
+	// refreshing its own window.
+	until := time.Now().Add(BurstTail)
+
+	var sent []Poke
+	rounds := map[string]int{}
+	report := func(reason, _ string) { rounds[reason]++ }
+
+	for len(unsettled) > 0 && time.Now().Before(until) {
+		select {
+		case <-ctx.Done():
+			return sent
+		case <-time.After(BurstTick):
+		}
+		var round []Poke
+		round, unsettled = p.attempt(ctx, unsettled, report)
+		sent = append(sent, round...)
 	}
 
-	if len(routine) > 0 {
-		log.Printf("🙈 Blind cycle: %v", summarise(routine))
+	// One line for the whole burst. Ten attempts at two pokes is twenty lines of the same three
+	// refusals, and the first attempt has already been logged per poke by the cycle itself.
+	if len(rounds) > 0 {
+		log.Printf("🔁 Burst: %v", summarise(rounds))
 	}
 	return sent
+}
+
+// shouldBurstBefore reports whether this cycle has just crossed a deadline, which is the only
+// time a burst is worth anything. It must be asked BEFORE the first attempt, because that attempt
+// is what makes the poke known.
+//
+// "Just crossed" is expressed as a poke the tracker has never seen leave before. A wedged round on
+// the 60-second retry has been sent many times already and must not re-open a ten-second burst
+// every minute; a deadline that has only now arrived produces a poke that is new.
+//
+// The caller pairs it with "something actually left this cycle", because with no path to the
+// chain there is nothing to re-send down.
+func (p *Poker) shouldBurstBefore(view View, due []Poke) bool {
+	if view.Blind || p.dryRun {
+		return false
+	}
+	for _, poke := range due {
+		if !p.tracker.Known(poke) {
+			return true
+		}
+	}
+	return false
 }
 
 // summarise renders the collapsed blind-mode outcomes, commonest first and alphabetically within
@@ -374,28 +481,18 @@ func waitWhileUnreadable(untilRotation time.Duration) time.Duration {
 	return wait
 }
 
-func (p *Poker) schedule(view View, wall time.Time, pending bool) (time.Duration, string) {
+func (p *Poker) schedule(view View, pending bool) (time.Duration, string) {
 	if p.blind.Blind() {
-		// No deadlines are known and nothing can be confirmed, so there is nothing to burst
-		// towards and nothing to chase. Plain retries until the read comes back.
+		// No deadlines are known and nothing can be confirmed, so there is nothing to aim at and
+		// nothing to chase. Plain retries until the read comes back.
 		return RetryInterval, "blind"
-	}
-	// The NEWEST, not the oldest: this answers "did we send something a moment ago", and using
-	// the oldest let one wedged round switch off the burst for every other round.
-	// `sent` is threaded through rather than inferred: an empty tracker reports an age of zero,
-	// which NextWait would otherwise read as "sent this instant" and answer with a one-second
-	// cadence, forever.
-	var age time.Duration
-	_, newest, sent := p.tracker.Newest(wall)
-	if sent {
-		age = newest
 	}
 	deadline, haveDeadline := NextDeadline(view)
 	var until time.Duration
 	if haveDeadline {
 		until = p.clock.Until(deadline)
 	}
-	return NextWait(pending, sent, age, until, haveDeadline)
+	return NextWait(pending, until, haveDeadline)
 }
 
 func (p *Poker) setBlind(readErr error) {

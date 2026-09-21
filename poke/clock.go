@@ -14,8 +14,18 @@ const (
 	// costs nobody anything, while being one attempt late costs a whole retry interval.
 	BurstLead = 2 * time.Second
 
-	// BurstTail is how long after the first send the one-second cadence continues.
-	BurstTail = 3 * time.Second
+	// BurstTail is how long the burst keeps re-sending, measured from its first send rather than
+	// from the most recent attempt - otherwise a poke that is refused every second would keep
+	// refreshing its own window and never stop.
+	//
+	// Ten seconds rather than three because an attempt no longer costs a read. It used to be a
+	// whole cycle, six liteserver round trips and about a second, which made the real cadence two
+	// seconds and fitted two attempts into a three-second tail. The burst now re-sends the set it
+	// already decided on without reading anything, so the window is bounded by what is useful
+	// rather than by what it costs: ten seconds covers a transition the chain applies several
+	// seconds after the computed deadline, which on 2026-09-20 came within four seconds of
+	// falling through to the 60-second retry.
+	BurstTail = 10 * time.Second
 
 	// BurstTick is the cadence inside the burst window.
 	BurstTick = time.Second
@@ -88,29 +98,17 @@ func (c *Clock) Until(deadline uint32) time.Duration {
 
 // NextWait decides how long to sleep before the next cycle, and why.
 //
-// It takes the age of the MOST RECENTLY sent poke, not the oldest. That distinction is the whole
-// correctness of this function and it was wrong once: with the oldest age, a single wedged round
-// whose poke had been outstanding for ten minutes pushed every cycle into the plain retry
-// interval, so a second round whose deadline arrived meanwhile got no burst and waited up to a
-// minute. The first-opportunity property switched itself off during exactly the incident it exists
-// for.
+// The rule is that nothing may sleep past something sooner: an approaching deadline and the retry
+// interval compete, and the nearer one wins.
 //
-// The rule is that nothing may sleep past something sooner. A just-sent poke wins outright,
-// because one second is already the floor; otherwise an approaching deadline and the retry
-// interval compete and the nearer one wins.
-//
-// `sent` is separate from `pending` and is not inferable from the age. `pending` means something
-// is due; `sent` means something actually left. Without the distinction an empty tracker reports
-// an age of zero, which reads as "sent this instant" and pins the loop at one second forever -
-// which is the state when every send is failing, or under DRY_RUN, the two situations where a hot
-// loop is least affordable.
-func NextWait(pending, sent bool, sinceNewestSend time.Duration, untilDeadline time.Duration, haveDeadline bool) (time.Duration, string) {
-	if pending && sent && sinceNewestSend < BurstTail {
-		// The tail of a burst: keep trying every second in case the block that carried the last
-		// attempt was produced a moment before the deadline. Nothing can be sooner than this.
-		return BurstTick, "burst"
-	}
-
+// It used to carry a third arm, a one-second "burst" cadence while a poke had recently left. That
+// moved into Cycle, which now re-sends inside one cycle without reading between attempts - the
+// burst is no longer expressed as a short sleep between cycles, and leaving the arm here would be
+// dead code that still looked load-bearing. Its one hard-won lesson survives in the move: the
+// burst is bounded by the age of the poke's FIRST send, so a wedged round whose poke has been
+// outstanding for ten minutes does not re-open a burst every cycle, and does not stop another
+// round's deadline getting one either.
+func NextWait(pending bool, untilDeadline time.Duration, haveDeadline bool) (time.Duration, string) {
 	wait, reason := RetryInterval, "idle"
 	if pending {
 		reason = "retry"
@@ -119,7 +117,7 @@ func NextWait(pending, sent bool, sinceNewestSend time.Duration, untilDeadline t
 	if haveDeadline {
 		toDeadline := untilDeadline - BurstLead
 		if toDeadline < BurstTick {
-			// The deadline is here, or within the lead. Open the burst.
+			// The deadline is here, or within the lead. Wake at the tick and open the burst.
 			toDeadline = BurstTick
 		}
 		if toDeadline > MaxSleep {
