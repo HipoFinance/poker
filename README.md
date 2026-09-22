@@ -71,8 +71,10 @@ so a build that meets something new stops and lets the next full cycle look at t
 Two more answers look like failures and are not. Exit code **7** is TVM's type check error and for
 these three handlers it has one cause: all of them `udict_get` the participation and hand a miss
 straight to `unpack_participation`, so 7 means *the treasury has no such round*. Blind mode
-produces it by design, because its candidates are guesses; a sighted cycle pokes only rounds it
-just read, so the same code there is worth a warning. And **`duplicate message`** is a node saying
+produces it by design, because its candidates are guesses — but so does a sighted cycle, because a
+round that has just recovered is deleted, and a poke decided from a read two seconds old still
+goes out. The alternative reading, that participations no longer unpack as expected, cannot get
+this far: it fails the treasury read first, and that is blind mode. And **`duplicate message`** is a node saying
 it already holds this exact external — the two instances build identical bodies on purpose, so one
 of them is routinely told the other's copy is queued. That is delivery, counted in
 `hipo_poker_pokes_duplicate_total`, and it is free deduplication: two instances cost the network

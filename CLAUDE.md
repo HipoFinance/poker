@@ -64,9 +64,12 @@ participation, so it cannot mean "done" on its own. An unknown code is unexpecte
 meeting something new stops the loop rather than feeding it. Do not collapse the two predicates.
 
 Two more wear a failure's clothes. **Exit code 7** is the treasury having no such round — all
-three handlers `udict_get` the participation and hand a miss to `unpack_participation` — so it is
-blind mode's ordinary answer and a sighted cycle's warning; `Expected` takes the blind flag for
-exactly that reason. **`duplicate message`** is a node saying it already holds this external,
+three handlers `udict_get` the participation and hand a miss to `unpack_participation`. It is
+ordinary in both modes: blind mode guesses rounds, and a sighted cycle sends from a read that is
+seconds old, so a round that recovered in between is already gone. It warned once, briefly, on the
+theory that it might mean participations had stopped unpacking — but that fails the treasury read
+first and shows up as blind mode, so the warning only ever fired on the benign case.
+**`duplicate message`** is a node saying it already holds this external,
 which is delivery: the two instances build identical bodies on purpose, and the collision is free
 deduplication, so do not salt the query id per instance to make it go away.
 
