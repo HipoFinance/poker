@@ -80,18 +80,22 @@ func (r Rejection) Reason() string {
 // work is already done, by an earlier copy of itself, by the other instance, or by a borrower.
 // Nothing about either is worth waking anyone for.
 //
-// round_not_found depends on where the poke came from, which is why blind is a parameter rather
-// than a property of the code. Blind mode guesses round numbers from the validator sets and most
-// of its guesses are wrong by construction, so 7 is its ordinary answer. A sighted cycle pokes
-// only rounds it just read out of the treasury's own dictionary, so 7 there means the round left
-// between the read and the send, or that participations no longer unpack the way this service
-// believes - and the second of those is the failure this whole service was built around.
-func (r Rejection) Expected(blind bool) bool {
+// round_not_found is expected too, and used to be expected only in blind mode. That was reasoned
+// out rather than measured, and mainnet disagreed on the first finish_participation after the
+// change: at 2026-09-22 00:43:53 the poke went out, at 00:43:54 the burst was told 204, and by
+// 00:43:56 the round had recovered and been deleted, so the next cycle - working from a read two
+// seconds old - sent one more and got 7. The round was gone because the service had just driven
+// it there. That is the ordinary case, not a fault, and it warned.
+//
+// The argument for warning was that 7 might instead mean participations no longer unpack the way
+// this service believes. It cannot usefully mean that here: the contract and this service read
+// the same cells, so a layout change fails parseTreasuryState first, which is a ShapeError and
+// therefore blind mode immediately - a louder and more specific signal than a warning on an exit
+// code. Nothing is lost by treating 7 as ordinary, and it still gets a line of its own.
+func (r Rejection) Expected() bool {
 	switch r.Code {
-	case 202, 203, 204, 205, 206, 207:
+	case 202, 203, 204, 205, 206, 207, exitTypeCheck:
 		return true
-	case exitTypeCheck:
-		return blind
 	}
 	return false
 }

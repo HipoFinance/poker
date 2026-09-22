@@ -247,13 +247,13 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	// matters. A sighted cycle pokes only rounds it just read, and every outcome there is worth
 	// its own line.
 	routine := map[string]int{}
-	report := func(reason, line string) {
+	report := reporter{routine: func(reason, line string) {
 		if view.Blind {
 			routine[reason]++
 			return
 		}
 		log.Print(line)
-	}
+	}}
 
 	burstWanted := p.shouldBurstBefore(view, due)
 	sent, unsettled := p.attempt(ctx, due, report)
@@ -294,12 +294,26 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	return p.schedule(view, len(due) > 0)
 }
 
+// reporter decides how one round of attempts speaks.
+//
+// A cycle's first round names every outcome, because it pokes a handful of rounds it just read
+// and each answer is worth having. A burst's later rounds count them instead and print one line
+// at the end: ten attempts at two pokes is twenty lines of the same two or three refusals, and
+// the whole point of logging on change is that silence means something.
+type reporter struct {
+	routine func(reason, line string)
+	// quietSends collapses an accepted send as well. Only a burst wants that. Everywhere else a
+	// send getting through is the most interesting thing a cycle does - including in blind mode,
+	// where it means one of the guessed rounds was real.
+	quietSends bool
+}
+
 // attempt sends each poke once. It reports what actually left for a liteserver, and which pokes
 // are still worth sending again without reading anything first.
 //
-// `report` decides what the ordinary outcomes look like in the log; warnings always go straight
-// out, because the codes that produce them all settle, so each can appear at most once per poke.
-func (p *Poker) attempt(ctx context.Context, due []Poke, report func(reason, line string)) (sent, unsettled []Poke) {
+// Warnings always go straight out rather than through the reporter, because every code that
+// produces one also settles, so each can appear at most once per poke.
+func (p *Poker) attempt(ctx context.Context, due []Poke, r reporter) (sent, unsettled []Poke) {
 	for _, poke := range due {
 		if p.dryRun {
 			log.Printf("🧪 Would send %v", poke)
@@ -318,7 +332,7 @@ func (p *Poker) attempt(ctx context.Context, due []Poke, report func(reason, lin
 			// Still unsettled: a node holding the bytes says nothing about the treasury running
 			// them, and the next attempt carries a new query id anyway, since the id is the
 			// chain clock in seconds.
-			report("already queued", fmt.Sprintf("👯 %v was already queued at a node", poke))
+			r.routine("already queued", fmt.Sprintf("👯 %v was already queued at a node", poke))
 			PokesDuplicate.WithLabelValues(poke.Op.String()).Inc()
 			sent = append(sent, poke)
 			unsettled = append(unsettled, poke)
@@ -336,8 +350,8 @@ func (p *Poker) attempt(ctx context.Context, due []Poke, report func(reason, lin
 			// because the work is already done drops out of the due set on the next read and is
 			// confirmed. It also keeps the burst going, which matters: a poke refused for being a
 			// second early wants retrying in a second, not in a minute.
-			if reject.Expected(p.blind.Blind()) {
-				report(reject.Reason(), fmt.Sprintf("↩️  %v refused: %v", poke, reject.Reason()))
+			if reject.Expected() {
+				r.routine(reject.Reason(), fmt.Sprintf("↩️  %v refused: %v", poke, reject.Reason()))
 			} else {
 				log.Printf("⚠️  %v refused for an unexpected reason: %v", poke, reject.Reason())
 			}
@@ -362,7 +376,12 @@ func (p *Poker) attempt(ctx context.Context, due []Poke, report func(reason, lin
 		// Deliberately not "sent successfully". A liteserver took the bytes; whether the treasury
 		// accepts them is decided by a guard that leaves no receipt either way - which is also
 		// why this poke stays unsettled and gets sent again.
-		log.Printf("📨 Sent %v", poke)
+		line := fmt.Sprintf("📨 Sent %v", poke)
+		if r.quietSends {
+			r.routine("sent", line)
+		} else {
+			log.Print(line)
+		}
 		PokesSent.WithLabelValues(poke.Op.String()).Inc()
 		sent = append(sent, poke)
 		unsettled = append(unsettled, poke)
@@ -392,7 +411,7 @@ func (p *Poker) burst(ctx context.Context, unsettled []Poke) []Poke {
 
 	var sent []Poke
 	rounds := map[string]int{}
-	report := func(reason, _ string) { rounds[reason]++ }
+	r := reporter{routine: func(reason, _ string) { rounds[reason]++ }, quietSends: true}
 
 	for len(unsettled) > 0 && time.Now().Before(until) {
 		select {
@@ -401,7 +420,7 @@ func (p *Poker) burst(ctx context.Context, unsettled []Poke) []Poke {
 		case <-time.After(BurstTick):
 		}
 		var round []Poke
-		round, unsettled = p.attempt(ctx, unsettled, report)
+		round, unsettled = p.attempt(ctx, unsettled, r)
 		sent = append(sent, round...)
 	}
 

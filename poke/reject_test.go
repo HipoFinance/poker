@@ -53,7 +53,7 @@ func TestAsRejectionReadsTheRealRefusals(t *testing.T) {
 			if r.Reason() != tt.reason {
 				t.Fatalf("reason %q, want %q", r.Reason(), tt.reason)
 			}
-			if !r.Expected(false) {
+			if !r.Expected() {
 				t.Fatalf("%v was treated as worth waking someone for", r.Reason())
 			}
 		})
@@ -83,7 +83,7 @@ func TestAsRejectionHandlesUnknownCodes(t *testing.T) {
 	if !ok {
 		t.Fatal("a refusal without an exit code was not recognised as one")
 	}
-	if r.Expected(false) || r.Expected(true) {
+	if r.Expected() {
 		t.Fatal("an unreadable refusal was treated as routine")
 	}
 	if r.Reason() != "no exit code reported" {
@@ -93,7 +93,7 @@ func TestAsRejectionHandlesUnknownCodes(t *testing.T) {
 	// err::stopped is not something these three ops can produce - none of them checks stopped? -
 	// so seeing it would mean the contract has changed under us.
 	stopped, _ := asRejection(lsRefusal("exitcode=106, steps=1, gas_used=0"))
-	if stopped.Expected(false) || stopped.Expected(true) {
+	if stopped.Expected() {
 		t.Fatal("err::stopped from an external was treated as routine")
 	}
 	if stopped.Reason() != "stopped (106)" {
@@ -110,12 +110,16 @@ const (
 	duplicateSend = "cannot send external message : duplicate message"
 )
 
-// TestRoundNotFoundDependsOnWhetherWeCouldSee. Exit code 7 is the treasury saying it has no such
-// round: all three handlers udict_get the participation and hand the miss straight to
-// unpack_participation, which loads from null. Blind mode produces it by design - its candidates
-// are guesses - but a sighted cycle pokes only rounds it just read, so the same code there means
-// something moved underneath the read, or participations no longer unpack as expected.
-func TestRoundNotFoundDependsOnWhetherWeCouldSee(t *testing.T) {
+// TestRoundNotFoundIsOrdinary. Exit code 7 is the treasury saying it has no such round: all three
+// handlers udict_get the participation and hand the miss straight to unpack_participation, which
+// loads from null.
+//
+// It used to warn outside blind mode, on the theory that a sighted cycle only pokes rounds it just
+// read. Mainnet disagreed within a day: at 2026-09-22 00:43:56 a poke went out against a read two
+// seconds old, for a round that had recovered and been deleted in between - because this service
+// had just driven it there. The alternative reading, that participations no longer unpack as
+// expected, cannot reach here: it fails parseTreasuryState first and that is blind mode.
+func TestRoundNotFoundIsOrdinary(t *testing.T) {
 	r, ok := asRejection(lsRefusal(refusedUnknownRound))
 	if !ok {
 		t.Fatal("exit code 7 was not read as a refusal")
@@ -126,11 +130,11 @@ func TestRoundNotFoundDependsOnWhetherWeCouldSee(t *testing.T) {
 	if r.Reason() != "round_not_found (7)" {
 		t.Fatalf("reason %q", r.Reason())
 	}
-	if !r.Expected(true) {
-		t.Fatal("blind mode was warned about a round it guessed at and the treasury does not hold")
+	if !r.Expected() {
+		t.Fatal("a round the treasury does not hold was reported as a fault")
 	}
-	if r.Expected(false) {
-		t.Fatal("a sighted cycle was not warned about a round vanishing between the read and the send")
+	if !r.Settled() {
+		t.Fatal("the burst kept re-sending at a round the treasury does not hold")
 	}
 }
 

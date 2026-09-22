@@ -121,7 +121,7 @@ func TestWhichRefusalsEndTheBurst(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p, _ := newPoker(tt.answer)
 			poke := Poke{Op: OpVsetChanged, RoundSince: currRound}
-			_, unsettled := p.attempt(context.Background(), []Poke{poke}, func(string, string) {})
+			_, unsettled := p.attempt(context.Background(), []Poke{poke}, quiet())
 			if tt.settled && len(unsettled) != 0 {
 				t.Fatalf("the burst would keep re-sending after %v", tt.name)
 			}
@@ -231,7 +231,7 @@ func TestNothingBurstsWhenNothingCanBeSent(t *testing.T) {
 	// And with every send failing, nothing is ever known to the tracker, so shouldBurstBefore
 	// stays true forever - which is why the cycle also requires that something actually left.
 	failing, f := newPoker(errors.New("dial tcp: connection refused"))
-	sent, _ := failing.attempt(context.Background(), due, func(string, string) {})
+	sent, _ := failing.attempt(context.Background(), due, quiet())
 	if len(sent) != 0 {
 		t.Fatal("a send that never reached the chain was counted as having left")
 	}
@@ -256,5 +256,66 @@ func TestABurstDoesNotResetAPokeAge(t *testing.T) {
 	if age < 80*time.Second {
 		t.Fatalf("after ten re-sends the poke reports an age of %v; the burst reset its clock "+
 			"and a wedged round would never reach the alert threshold", age)
+	}
+}
+
+// quiet is a reporter that says nothing, for tests that assert on the returned sets rather than
+// on the log.
+func quiet() reporter {
+	return reporter{routine: func(string, string) {}, quietSends: true}
+}
+
+// TestOnlyABurstCollapsesAnAcceptedSend. The first rotation after the burst landed printed five
+// "Sent" lines and one aggregate, because the accepted-send line did not go through the reporter
+// like the refusals did. Twenty attempts should read as one line, not six.
+//
+// Outside a burst the opposite holds, including in blind mode, where a send getting through means
+// one of the guessed rounds was real.
+func TestOnlyABurstCollapsesAnAcceptedSend(t *testing.T) {
+	poke := Poke{Op: OpVsetChanged, RoundSince: currRound}
+
+	for _, tt := range []struct {
+		name       string
+		quietSends bool
+		want       int
+	}{
+		{"inside a burst", true, 1},
+		{"a plain cycle", false, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p, _ := newPoker(nil) // accepted
+			counted := map[string]int{}
+			r := reporter{
+				routine:    func(reason, _ string) { counted[reason]++ },
+				quietSends: tt.quietSends,
+			}
+			p.attempt(context.Background(), []Poke{poke}, r)
+			if counted["sent"] != tt.want {
+				t.Fatalf("the reporter was told about %d accepted sends, want %d",
+					counted["sent"], tt.want)
+			}
+		})
+	}
+}
+
+// And the whole of a rotation's burst is one line: the five accepted sends and fifteen refusals
+// mainnet produced on 2026-09-21 collapse to a single summary.
+func TestARotationBurstSummarisesToOneLine(t *testing.T) {
+	t.Parallel()
+
+	p, _ := newPoker(nil, nil, refusal(206))
+	counted := map[string]int{}
+	r := reporter{routine: func(reason, _ string) { counted[reason]++ }, quietSends: true}
+
+	unsettled := []Poke{{Op: OpVsetChanged, RoundSince: currRound}}
+	for i := 0; i < 3; i++ {
+		_, unsettled = p.attempt(context.Background(), unsettled, r)
+	}
+
+	if counted["sent"] != 2 || counted["vset_not_changed (206)"] != 1 {
+		t.Fatalf("the burst reported %v; both kinds of outcome have to reach the summary", counted)
+	}
+	if line := summarise(counted); line == "" {
+		t.Fatal("the summary was empty")
 	}
 }
