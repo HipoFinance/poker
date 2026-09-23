@@ -48,8 +48,11 @@ Do not collapse those branches, and do not "fix" the stopped case by skipping th
 strands the collateral of borrowers who bid before the halt.
 
 **A refusal is not a failure.** The treasury throwing before `accept_message` is what this
-service is built on, and it surfaces as a liteserver error that looks like a transport failure.
-`asRejection` in `poke/reject.go` separates them, and three things hang off that: only a real
+service is built on, and it surfaces as a liteserver error that looks like a transport failure —
+in *two* shapes, because endpoints disagree: code `-701` with `exitcode=NNN`, and code `0` with
+the bare sentence *external message was not accepted*. Match on the code alone and the second one
+warns, counts as an error and drops its poke from the burst, which is what happened on
+2026-09-23. `asRejection` in `poke/reject.go` separates them, and three things hang off that: only a real
 transport failure warns, only a real transport failure counts in
 `hipo_poker_poke_errors_total` (which `PokerNotSending` alerts on — conflating them paged about
 every round), and a refused poke still counts as **sent**, so the burst keeps its cadence and the

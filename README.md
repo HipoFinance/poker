@@ -51,8 +51,9 @@ charged. That is what makes the burst, two instances and duplicate borrower poke
 A consequence worth stating, because it is easy to get wrong: **a refused external is the ordinary
 case, not a fault.** It arrives looking like a transport error — the node reports that it could not
 apply the message — but it means the message *did* reach the chain and was run. So refusals are
-told apart by the liteserver code, logged as one line naming the guard (`too_soon_to_participate`,
-`vset_not_changed`, …), counted in `hipo_poker_pokes_rejected_total` rather than the error counter,
+told apart from a real transport failure, logged as one line naming the guard
+(`too_soon_to_participate`, `vset_not_changed`, …), counted in `hipo_poker_pokes_rejected_total`
+rather than the error counter,
 and **counted as sent**: the burst keeps its cadence, because a poke refused for being a second
 early wants retrying at once, not in a minute. That is not theoretical — on 2026-09-20 at 18:52:52
 `participate_in_election` was refused with `too_soon_to_participate` and accepted at 18:52:54.
@@ -67,6 +68,13 @@ successful one, because the handler packs the new hash back into the participati
 cannot be read as "done" without a read; retrying a finished round costs a discarded external,
 while dropping an unfinished one costs a minute. **An unrecognised code is unexpected and settles**,
 so a build that meets something new stops and lets the next full cycle look at the chain.
+
+Telling them apart takes two rules, not one, because endpoints disagree on how to say it. One
+answers liteserver code `-701` with `exitcode=NNN` in the text; another answers code `0` and the
+sentence *external message was not accepted*, carrying no code at all. Both mean a guard threw.
+The second is treated as ordinary and keeps its poke in the burst: the cause is a node that
+reports less, not a contract doing something new, and with no code there is nothing to conclude
+from.
 
 Two more answers look like failures and are not. Exit code **7** is TVM's type check error and for
 these three handlers it has one cause: all of them `udict_get` the participation and hand a miss
