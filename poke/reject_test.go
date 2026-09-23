@@ -75,20 +75,10 @@ func TestAsRejectionIgnoresTransportFailures(t *testing.T) {
 	}
 }
 
-// A refusal with no readable exit code, or one the contract does not produce from an external,
-// still has to be reported rather than swallowed - it is the case where something is genuinely
-// wrong and the service does not know what.
+// A refusal the contract does not produce from an external still has to be reported rather than
+// swallowed - that is the case where something is genuinely wrong and the service does not know
+// what.
 func TestAsRejectionHandlesUnknownCodes(t *testing.T) {
-	r, ok := asRejection(lsRefusal("External message was not accepted: something new"))
-	if !ok {
-		t.Fatal("a refusal without an exit code was not recognised as one")
-	}
-	if r.Expected() {
-		t.Fatal("an unreadable refusal was treated as routine")
-	}
-	if r.Reason() != "no exit code reported" {
-		t.Fatalf("reason %q", r.Reason())
-	}
 
 	// err::stopped is not something these three ops can produce - none of them checks stopped? -
 	// so seeing it would mean the contract has changed under us.
@@ -164,3 +154,55 @@ func TestDuplicateIsNotAFailure(t *testing.T) {
 // duplicateErr is the error a node returns when it already holds the message, as the service
 // sees it.
 func duplicateErr() error { return ton.LSError{Code: 0, Text: duplicateSend} }
+
+// The second shape a refusal arrives in, verbatim from poker1 on 2026-09-23 at 04:01:27. The node
+// ran the message, the contract refused it, and the node said so in a sentence with no exit code
+// and LSError code 0 rather than -701.
+const refusedWithoutACode = "cannot apply external message to current state : " +
+	"external message was not accepted"
+
+// TestARefusalWithoutAnExitCodeIsStillARefusal. Matched on the -701 code alone this read as a
+// failure to reach the chain: it warned, it counted into hipo_poker_poke_errors_total - which
+// PokerNotSending alerts on, so it would have paged - and a transport failure settles, so it also
+// dropped the poke out of the burst.
+func TestARefusalWithoutAnExitCodeIsStillARefusal(t *testing.T) {
+	err := ton.LSError{Code: 0, Text: refusedWithoutACode}
+
+	r, ok := asRejection(err)
+	if !ok {
+		t.Fatal("a refusal reported without an exit code was read as a failure to reach the chain")
+	}
+	if r.Code != 0 {
+		t.Fatalf("exit code %d, want 0 for a refusal the node did not label", r.Code)
+	}
+	if !r.Expected() {
+		t.Fatal("an unlabelled refusal warned; the cause is a node that reports less, not a fault")
+	}
+	if r.Settled() {
+		t.Fatal("an unlabelled refusal ended the burst; there is nothing to conclude from no code")
+	}
+	if r.Reason() != "refused, with no exit code reported" {
+		t.Fatalf("reason %q", r.Reason())
+	}
+
+	// The -701 form spells the same sentence with a capital E and carries the code as well, so
+	// the text match must not shadow the exit code when both are present.
+	labelled, ok := asRejection(lsRefusal(refusedVset))
+	if !ok || labelled.Code != 206 {
+		t.Fatalf("the labelled form lost its exit code: %v, ok=%v", labelled.Code, ok)
+	}
+}
+
+// And a genuine transport failure must still be one, or PokerNotSending goes blind.
+func TestTextMatchingDoesNotSwallowTransportFailures(t *testing.T) {
+	for _, err := range []error{
+		errors.New("context deadline exceeded"),
+		ton.LSError{Code: 0, Text: "cannot send external message : too many requests"},
+		ton.LSError{Code: -400, Text: "not ready"},
+		ton.LSError{Code: 651, Text: "block is not applied"},
+	} {
+		if r, ok := asRejection(err); ok {
+			t.Fatalf("%v was read as a refusal with %v", err, r.Reason())
+		}
+	}
+}

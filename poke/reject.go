@@ -27,9 +27,20 @@ type Rejection struct {
 	Code int
 }
 
-// lsErrNotAccepted is the liteserver's code for "I ran this against the current state and the
-// contract refused it".
+// lsErrNotAccepted is one liteserver's code for "I ran this against the current state and the
+// contract refused it". It is not the only shape that answer comes in - see notAcceptedText.
 const lsErrNotAccepted = -701
+
+// notAcceptedText is the same answer from a node that reports no code for it. On 2026-09-23 at
+// 04:01:27 an endpoint refused a vset_changed with LSError code 0 and the text "cannot apply
+// external message to current state : external message was not accepted", with no exitcode= in
+// it at all. That is a guard throwing before accept_message, exactly like a -701, but matched on
+// the code alone it read as a failure to reach the chain: warned, counted into
+// hipo_poker_poke_errors_total - which PokerNotSending alerts on - and dropped from the burst.
+//
+// Matched case-insensitively because the -701 form spells it with a capital E, inside a longer
+// message that also carries the exit code.
+const notAcceptedText = "external message was not accepted"
 
 // exitTypeCheck is TVM's type check error, and for these three handlers it has exactly one
 // cause: the round is not in the treasury's dictionary.
@@ -67,7 +78,7 @@ func (r Rejection) Reason() string {
 		return fmt.Sprintf("%v (%d)", name, r.Code)
 	}
 	if r.Code == 0 {
-		return "no exit code reported"
+		return "refused, with no exit code reported"
 	}
 	return fmt.Sprintf("exit code %d", r.Code)
 }
@@ -95,6 +106,13 @@ func (r Rejection) Reason() string {
 func (r Rejection) Expected() bool {
 	switch r.Code {
 	case 202, 203, 204, 205, 206, 207, exitTypeCheck:
+		return true
+	case 0:
+		// A refusal the node reported without an exit code. This used to warn, on the reasoning
+		// that not knowing why is itself worth knowing - and it was wrong: the cause is a node
+		// that reports less, not a contract doing something new. Every guard in these three
+		// handlers refuses before accept_message and every one of them is ordinary, so an
+		// unlabelled refusal is overwhelmingly one of those.
 		return true
 	}
 	return false
@@ -127,6 +145,11 @@ func (r Rejection) Settled() bool {
 	switch r.Code {
 	case 203, 205, 206:
 		return false
+	case 0:
+		// No code reported, so there is nothing to conclude from. Keep going, by the same
+		// asymmetry that keeps 206 going: another attempt costs a discarded external, and
+		// giving up on a poke that was merely early costs a minute.
+		return false
 	}
 	return true
 }
@@ -137,9 +160,16 @@ func (r Rejection) Settled() bool {
 // refused message did reach a node and was run, so it did.
 func asRejection(err error) (Rejection, bool) {
 	var ls ton.LSError
-	if !errors.As(err, &ls) || ls.Code != lsErrNotAccepted {
+	if !errors.As(err, &ls) {
 		return Rejection{}, false
 	}
+	if ls.Code != lsErrNotAccepted &&
+		!strings.Contains(strings.ToLower(ls.Text), notAcceptedText) {
+		return Rejection{}, false
+	}
+	// Zero means the node reported no exit code, which is a real answer rather than a missing
+	// one: a refusal can never carry exit code 0, because 0 is what a handler that reached
+	// accept_message returns.
 	var code int
 	if m := exitCodePattern.FindStringSubmatch(ls.Text); m != nil {
 		code, _ = strconv.Atoi(m[1])
