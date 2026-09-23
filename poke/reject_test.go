@@ -191,6 +191,14 @@ func TestARefusalWithoutAnExitCodeIsStillARefusal(t *testing.T) {
 	if !ok || labelled.Code != 206 {
 		t.Fatalf("the labelled form lost its exit code: %v, ok=%v", labelled.Code, ok)
 	}
+
+	// Two endpoints already phrase this differently, one capitalised and one not, and only one of
+	// them sets -701. A node that combines the two - the capitalised sentence without the code -
+	// is the gap a case-sensitive match would leave, and it would leave it silently.
+	mixed := ton.LSError{Code: 0, Text: "External message was not accepted"}
+	if _, ok := asRejection(mixed); !ok {
+		t.Fatal("the same sentence capitalised differently was read as a transport failure")
+	}
 }
 
 // And a genuine transport failure must still be one, or PokerNotSending goes blind.
