@@ -173,6 +173,7 @@ var (
 )
 
 func init() {
+	precreateCounters()
 	LastReadSuccess.Set(float64(time.Now().Unix()))
 	LastTreasuryRead.Set(float64(time.Now().Unix()))
 	TreasuryStateFieldsExpected.Set(treasuryStateMinFields)
@@ -182,6 +183,51 @@ func init() {
 	TreasuryStateFields.Set(-1)
 	ReadBlockSeqno.Set(0)
 	DryRun.Set(0)
+}
+
+// precreateCounters exports every counter series this service can produce, at zero, from the
+// moment the process starts.
+//
+// A counter label set otherwise comes into existence on its first increment, and Prometheus never
+// sees the increment that created it: rate() and increase() need a sample before the change, and
+// there is none. For a counter born mid-burst it is worse - everything before the first scrape is
+// lost. Measured on 2026-09-23: both code="206" series first appeared already at 5 and 10, which
+// was the whole of the first rotation burst, and increase() over the next 48 hours reported 33
+// refusals where the logs showed 48.
+//
+// The one that mattered is PokeErrors, because PokerNotSending is a rate over it. With no series
+// until the first failure, the first transport failure of each op after every restart was
+// invisible to the alert - which also happened to be hiding that the alert itself fired on a
+// single blip. Both are fixed together; see operation's poker-alerting-rule.yaml.
+//
+// PokesRejected is created for every exit code this service knows how to name, plus 0 for a
+// refusal reported without one. A code outside that set still gets a series on first sight, and
+// losing that first increment is acceptable for a code nobody expected.
+func precreateCounters() {
+	precreate(AllOps, knownCodes(), []*prometheus.CounterVec{PokesSent, PokeErrors, PokesDuplicate, Confirmed}, PokesRejected)
+}
+
+// knownCodes is every exit code this service can name, plus 0 for a refusal reported without one.
+func knownCodes() []string {
+	codes := []string{"0"}
+	for code := range treasuryErrors {
+		codes = append(codes, strconv.Itoa(code))
+	}
+	return codes
+}
+
+// precreate is precreateCounters over vectors it is handed, so that it can be tested against fresh
+// ones rather than the package's, which every other test in the binary is also incrementing.
+func precreate(ops []Op, codes []string, perOp []*prometheus.CounterVec, rejected *prometheus.CounterVec) {
+	for _, op := range ops {
+		name := op.String()
+		for _, vec := range perOp {
+			vec.WithLabelValues(name)
+		}
+		for _, code := range codes {
+			rejected.WithLabelValues(name, code)
+		}
+	}
 }
 
 // published is the label set currently exported by UnconfirmedPoke, so that stale series can be
