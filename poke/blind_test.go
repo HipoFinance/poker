@@ -20,7 +20,7 @@ func blindNetwork() NetworkConfig {
 // TestCandidatesReachEveryRoundTheTreasuryCanHold pins what blind mode aims at.
 //
 // The validator sets name only three rounds, but request_loan lets the treasury hold eight
-// (treasury.fc:726). A round that missed two rotations, or one left in `held` well past its
+// (its `participations_count <= 7` check). A round that missed two rotations, or one left in `held` well past its
 // stake_held_until, has a round_since older than config 32 - and those are exactly the incidents
 // the spec's Problem section describes. Reaching only as far as the previous set would make blind
 // mode unable to see precisely the rounds it exists to rescue, and blind mode has no exit timer:

@@ -21,9 +21,9 @@ const BlindParticipateWindow = 2 * time.Hour
 //
 // It exists because participate_until is NOT A GUARD, and this service is otherwise built on the
 // assumption that an early send is free. participate_in_election's guards are `state == open` and
-// `now() >= min(participate_since, round_since)`, and both run before accept_message
-// (treasury.fc:883-886). participate_until is read later, inside distribute (treasury.fc:828),
-// after the message has been accepted and the state committed:
+// `now() >= min(participate_since, round_since)`, and both run before its accept_message.
+// participate_until is read later, inside distribute, after the message has been accepted and
+// the state committed:
 //
 //	int elected?  = ~ config_param(config::next_validators).null?();
 //	int too_late? = now() >= min(participate_until, round_since);
@@ -37,7 +37,7 @@ const BlindParticipateWindow = 2 * time.Hour
 // one early copy is irreversible, because every later copy then throws unable_to_participate.
 //
 // 300 seconds because that is when config 36 appears anyway: participate_until is
-// next_round_since - elections_end_before - 300 (get_times, treasury.fc:649-650) and the next
+// next_round_since - elections_end_before - 300 (see get_times) and the next
 // validator set is published at next_round_since - elections_end_before. So for the upcoming
 // round this arm now fires no earlier than the elected? arm, which has no race in either
 // direction. What the arm still buys is the stale open round, whose threshold is round_since and

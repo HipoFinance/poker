@@ -27,8 +27,8 @@ Poker is the driver of last resort. Borrowers keep poking; this is redundancy, n
 `accept_message()` itself, so the sender pays no gas and signs nothing. A fully compromised poker
 host can do nothing that an anonymous stranger could not already do.
 
-That is also why the governor retries — `retry_distribute`, `retry_recover_stakes`,
-`retry_burn_all`, `retry_mint_bill` — are deliberately out of scope. They are internal messages
+That is also why the governor retries — `retry_recover_stakes`, `retry_burn_all`,
+`retry_burn_ready`, `retry_mint_bill` — are deliberately out of scope. They are internal messages
 gated on `governor | halter`, and automating them would mean a hot governance key on an always-on
 box.
 

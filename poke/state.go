@@ -27,9 +27,17 @@ const (
 	treasuryParticipationsIndex = 7
 	treasuryStoppedIndex        = 9
 
-	// The shape as of the 2026-09-08 release (26 fields, mid_rate and mid_round appended).
-	// Append-only means a longer tuple is expected and fine; a shorter one is not.
-	treasuryStateMinFields = 26
+	// The deployed shape: 28 fields, as of the 2026-09-26 release, which appended reward_share
+	// (26) and total_request_fees (27) after mid_rate and mid_round. Nothing moved - index 7 and
+	// index 9 are where they have been since 2026-09-06 - so this is a floor raised to match what
+	// the treasury actually returns, not a shape this service had to learn.
+	//
+	// It was 26 until then, which kept working against the 28-field tuple for days, because a
+	// longer tuple is fine by the append-only rule. It is raised anyway so that the floor names the
+	// release that is live: hipo_poker_treasury_state_fields_expected then agrees with gauge's,
+	// and a tuple that ever comes back SHORTER than what is deployed reads as the shape failure it
+	// would be. Append-only means a longer tuple is expected and fine; a shorter one is not.
+	treasuryStateMinFields = 28
 
 	// get_times returns exactly six values and is not an append-only interface, so it is pinned
 	// exactly rather than as a floor.
