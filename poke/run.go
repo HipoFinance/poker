@@ -17,6 +17,8 @@ type Options struct {
 	Treasury        *address.Address
 	OwnServers      []LiteServer
 	GlobalConfigURL string
+	// TonapiMessageURL is where every send is also submitted; empty turns that path off.
+	TonapiMessageURL string
 	// DryRun computes and logs what would be sent and sends nothing. It exists for the rehearsal
 	// the spec asks for before the first deploy: run a full round against mainnet and diff what
 	// this would have sent against what the borrowers actually sent.
@@ -49,7 +51,7 @@ type Poker struct {
 const logHeartbeat = 30 * time.Minute
 
 func New(ctx context.Context, o Options) (*Poker, error) {
-	chain, err := NewChain(ctx, o.Treasury, o.OwnServers, o.GlobalConfigURL)
+	chain, err := NewChain(ctx, o.Treasury, o.OwnServers, o.GlobalConfigURL, o.TonapiMessageURL)
 	if err != nil {
 		return nil, err
 	}

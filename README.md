@@ -138,12 +138,20 @@ round that missed two rotations is exactly the kind this service exists to rescu
 | `OWN_LITESERVERS` | `host:port@base64key`, comma-separated. Tried first. |
 | `GLOBAL_CONFIG_URL` | public liteserver pool, default `https://ton.org/global.config.json` |
 | `METRICS_PORT` | default `10000` |
+| `TONAPI_MESSAGE_URL` | also submit every send here, default `https://tonapi.io/v2/blockchain/message`; `off` turns it off |
 | `DRY_RUN` | compute and log every poke, send none |
 
 Both liteserver sources are optional individually but not together. Own nodes are preferred
 because they are closer and answer faster, which is what matters at a deadline; the public pool is
 there because own nodes share a failure domain with the validators, and validators going down is
 one of the cases this service exists to survive.
+
+Every send also goes to tonapi, which runs its own nodes, in the background. On 2026-10-01 every
+liteserver took `finish_participation` for nine and a half minutes without any copy reaching a
+collator - a fault in the public overlay, per TON Core. tonapi is a path only: its answer never
+counts as a send, an error or a confirmation, because it refuses every early poke with an HTTP
+error of its own (406, carrying the treasury's exit code), and counting that would page about every
+round. It shows in `hipo_poker_tonapi_submits_total{result}` and in a log line when the result changes.
 
 ## Metrics
 
@@ -155,7 +163,8 @@ one of the cases this service exists to survive.
 `hipo_poker_poke_errors_total{op}`,
 `hipo_poker_confirmed_transitions_total{op}`, `hipo_poker_treasury_state_fields`,
 `hipo_poker_treasury_state_fields_expected`, `hipo_poker_clock_offset_seconds`,
-`hipo_poker_clock_synced`, `hipo_poker_last_clock_success_seconds`, `hipo_poker_dry_run`.
+`hipo_poker_clock_synced`, `hipo_poker_last_clock_success_seconds`, `hipo_poker_dry_run`,
+`hipo_poker_tonapi_submits_total{result}` (`accepted`, `refused`, `unreachable`; diagnostic only).
 
 `hipo_poker_unconfirmed_poke_seconds` counts only pokes that actually left for a liteserver, and a
 poke is confirmed when the *treasury* would no longer accept it — not when this service stops

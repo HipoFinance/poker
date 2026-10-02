@@ -47,6 +47,10 @@ func main() {
 		GlobalConfigURL: envOr("GLOBAL_CONFIG_URL", "https://ton.org/global.config.json"),
 		DryRun:          envBool("DRY_RUN"),
 	}
+	// On unless turned off with "off": a path of its own beside the liteservers. See poke/tonapi.go.
+	if url := envOr("TONAPI_MESSAGE_URL", poke.DefaultTonapiMessageURL); url != "off" {
+		opts.TonapiMessageURL = url
+	}
 	if opts.DryRun {
 		log.Println("🧪 DRY_RUN is set: every poke will be computed and logged, and none will be sent")
 	}

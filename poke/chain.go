@@ -34,6 +34,9 @@ type Endpoint struct {
 type Chain struct {
 	endpoints []*Endpoint
 	treasury  *address.Address
+	// tonapi is one more path for every send, beside the endpoints; nil when it is turned off. It
+	// carries no reads and no session, which is why it is not an Endpoint.
+	tonapi *tonapi
 }
 
 // Session pins one cycle to one endpoint and one masterchain block, so every read in that cycle
@@ -51,8 +54,8 @@ type Session struct {
 // that fails to dial at startup is dropped with a log line rather than being fatal: one working
 // endpoint is enough to poke, and refusing to start because the slower one is down would be the
 // wrong trade for a service whose job is to be up.
-func NewChain(ctx context.Context, treasury *address.Address, ownServers []LiteServer, globalConfigURL string) (*Chain, error) {
-	c := &Chain{treasury: treasury}
+func NewChain(ctx context.Context, treasury *address.Address, ownServers []LiteServer, globalConfigURL, tonapiURL string) (*Chain, error) {
+	c := &Chain{treasury: treasury, tonapi: newTonapi(tonapiURL)}
 
 	if len(ownServers) > 0 {
 		pool := liteclient.NewConnectionPool()
@@ -299,7 +302,13 @@ const sendTimeout = 5 * time.Second
 // It reports success if any endpoint accepted the bytes. Note that this says nothing about
 // whether the treasury will accept the message: an external that fails a guard is discarded with
 // no transaction and no receipt. Confirmation is a state re-read, in due.go.
+//
+// Every send also goes to tonapi, in the background and outside that report: see tonapi.go for
+// why it is a path and not an endpoint.
 func (c *Chain) Send(ctx context.Context, body *cell.Cell) error {
+	if c.tonapi != nil {
+		c.tonapi.submitDetached(ctx, c.treasury, body)
+	}
 	// Endpoints in parallel, with a short timeout each. Serially, a single hanging endpoint would
 	// add its full timeout to every poke in the cycle - and blind mode can have two dozen pokes -
 	// which would stretch a sixty-second cycle into minutes and make the service miss the

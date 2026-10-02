@@ -85,6 +85,16 @@ var (
 		Help: "Sends a node already had queued, by op. These are delivered, not failed.",
 	}, []string{"op"})
 
+	// TonapiSubmits counts submissions to tonapi by how they went. Diagnostic only, and kept out of
+	// PokesSent and PokeErrors on purpose: tonapi answers a poke the treasury refuses - the ordinary
+	// early one - with an HTTP error, so "refused" climbs every round and means nothing on its own.
+	// What it is for is the other two: "accepted" says the path works, and "unreachable" climbing
+	// while the liteservers are fine says it does not.
+	TonapiSubmits = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hipo_poker_tonapi_submits_total",
+		Help: "Pokes also submitted through tonapi, by result: accepted, refused or unreachable.",
+	}, []string{"result"})
+
 	// LastTreasuryRead is the unix time of the last trusted read of get_treasury_state, as
 	// opposed to LastReadSuccess, which only says the chain was reachable. The two differ for
 	// exactly the window BlindTransportGrace covers: the treasury read is failing, blind mode has
@@ -205,6 +215,9 @@ func init() {
 // losing that first increment is acceptable for a code nobody expected.
 func precreateCounters() {
 	precreate(AllOps, knownCodes(), []*prometheus.CounterVec{PokesSent, PokeErrors, PokesDuplicate, Confirmed}, PokesRejected)
+	for _, result := range []string{tonapiAccepted, tonapiRefused, tonapiUnreachable} {
+		TonapiSubmits.WithLabelValues(result)
+	}
 }
 
 // knownCodes is every exit code this service can name, plus 0 for a refusal reported without one.
