@@ -44,6 +44,14 @@ clock,
 read from a liteserver, because the treasury's guards compare against a block's `gen_utime` and a
 host clock a few seconds fast would fire early on every round forever.
 
+**It watches for a round that does not exist yet.** A participation only appears once the first
+loan request for it arrives, and sealed bids arrive a second before the election window. So the
+window's opening is a deadline in its own right, known from `get_times` whether or not anyone has
+bid: the loop wakes for it, reads every tick for thirty seconds so a round created at the last
+moment is found as soon as a read can see it, and polls the rest of the window once a minute. Before
+this, a round first bid on at the wire was found up to five minutes late — on 2026-10-07 the poker
+woke to find one already staked by a poke sent from elsewhere, 118 seconds into the window.
+
 **Over-poking is free.** Every guard in the treasury runs *before* `accept_message()`, so a
 mistimed external is discarded in the compute phase with no transaction committed and nobody
 charged. That is what makes the burst, two instances and duplicate borrower pokes all cost nothing.

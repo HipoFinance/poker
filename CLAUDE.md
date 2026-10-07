@@ -68,6 +68,13 @@ the wait: once any node has answered, `collect` gives the others one tick (`answ
 whole `sendTimeout`, or one hung endpoint costs every send in a burst five seconds. With no verdict
 at all it still waits for everyone, because then "nothing left" is the only honest report.
 
+**A deadline does not need a participation.** Every deadline but one is read off a round the
+treasury holds, and a round is only held once someone has bid. Bids are sealed and land a second
+before the window, so "no round on the books" is the normal state right up to the deadline that
+matters most. `unopenedRoundDeadline` in `poke/due.go` makes `participate_since` a deadline from
+`get_times` alone, held for `ParticipateGrace` past its time like the rotation is. When adding a
+deadline, ask what the loop does when the thing it is read from is not there yet.
+
 **A read can be behind the chain, and a refusal can say so.** A read pins the last masterchain
 block; a send is run against the node's newest shard state, and the treasury is on basechain. So a
 cycle can read a round as due, send, and be told the round has already moved past that op
