@@ -210,8 +210,11 @@ func participateAt(participateSince, roundSince uint32) uint32 {
 	return participateSince
 }
 
-// NextDeadline is the earliest future moment at which some poke becomes legal, so the loop can
-// sleep until it rather than poll towards it.
+// NextDeadline is the earliest moment the loop has to be awake for, so that it can sleep until it
+// rather than poll towards it. Mostly that is when some poke becomes legal. Two deadlines are
+// instead events that have to be WATCHED for, and are kept for a while after their time has
+// passed: the validator-set rotation, and the opening of an election window whose round does not
+// exist yet.
 //
 // Blind mode has no deadlines: it does not know which rounds exist or what state they are in, so
 // it falls back to the plain retry interval. That is part of the cost of a failed read, and it is
@@ -262,11 +265,70 @@ func NextDeadline(v View) (uint32, bool) {
 			}
 		}
 	}
+	if at, ok := v.unopenedRoundDeadline(); ok {
+		deadlines = append(deadlines, at)
+	}
 	if len(deadlines) == 0 {
 		return 0, false
 	}
 	sort.Slice(deadlines, func(i, j int) bool { return deadlines[i] < deadlines[j] })
 	return deadlines[0], true
+}
+
+// ParticipateGrace is how long past participate_since the loop keeps reading every tick for a
+// round that does not exist yet.
+//
+// A round created one second before the window is in a shard block the next masterchain block
+// has still to reference, so a read cannot see it for a few seconds after it has landed. Thirty
+// seconds is several times that and still a bounded cost: a round nobody bids on at all pays it
+// in full, about thirty reads, once.
+const ParticipateGrace = 30 * time.Second
+
+const (
+	participateGraceSeconds = uint32(ParticipateGrace / time.Second)
+	retrySeconds            = uint32(RetryInterval / time.Second)
+)
+
+// unopenedRoundDeadline is the deadline for a round that is not there yet.
+//
+// A participation only exists once the first request_loan for it arrives, and every other
+// deadline here is read off a participation - so with no request on the books the election window
+// was invisible, and the loop slept through its opening. That was harmless while bids arrived
+// minutes ahead. On 2026-10-07 both of our borrower hosts began broadcasting their sealed bid one
+// second before the window, nobody else had bid, and the first request for round 1791381256
+// landed at 11:22:43. The window opened at 11:22:44. This service had last read at 11:20:15, seen
+// one round and nothing to aim at, and slept its five minutes; participate_in_election went out
+// from somewhere else at 11:24:42, 118 seconds into the window, and the poker woke at 11:25:15 to
+// find the round staked. The service whose point is the first second was not looking.
+//
+// participate_since does not need a participation to be known: get_times derives it from the
+// validator set. So it is a deadline in its own right. Before the window the loop sleeps to it
+// like any other; from the lead until ParticipateGrace past it the deadline is kept, which holds
+// the one-tick cadence until a read can see the round; and for the rest of the window it polls
+// at the retry interval rather than MaxSleep, so a bid that arrives late waits a minute and not
+// five.
+//
+// This changes only when the chain is READ. What is sent is still decided by Due from what the
+// read finds, under the same rules as before.
+//
+// Not when the treasury is stopped: request_loan throws err::stopped, so no round can open, and
+// there is nothing to watch for.
+func (v View) unopenedRoundDeadline() (uint32, bool) {
+	t := v.Treasury.Times
+	if v.Treasury.Stopped || t.ParticipateSince == 0 || t.ParticipateUntil <= t.ParticipateSince {
+		return 0, false
+	}
+	if _, exists := v.Treasury.Participations[t.NextRoundSince]; exists {
+		// The round is on the books, in whatever state. Its own arm above speaks for it.
+		return 0, false
+	}
+	switch {
+	case v.Now < t.ParticipateSince+participateGraceSeconds:
+		return t.ParticipateSince, true
+	case v.Now < t.ParticipateUntil:
+		return v.Now + retrySeconds, true
+	}
+	return 0, false
 }
 
 // Tracker remembers when each outstanding poke was first sent, so that "we have been shouting at

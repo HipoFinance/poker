@@ -220,22 +220,28 @@ func TestNotStoppedParticipatesInTheElectionWindow(t *testing.T) {
 // TestNextDeadline pins what the loop sleeps until. This is what makes the first poke land in the
 // first block after a transition becomes legal rather than up to a minute later.
 func TestNextDeadline(t *testing.T) {
+	// The rotation cases are read after the election window has closed. Before it opens, a view
+	// holding no round for the next election has the window's opening as an earlier deadline -
+	// see TestTheElectionWindowIsADeadlineBeforeAnyoneBids - and these are about the rotation.
+	afterWindow := electionAt + 700
+
 	tests := []struct {
 		name  string
 		round uint32
 		state State
 		hash  *big.Int
 		until uint32
+		now   uint32
 		want  uint32
 	}{
-		{"open waits for the election window", nextRound, StateOpen, currentHash, 0, electionAt},
-		{"held waits for stake_held_until", prevRound, StateHeld, currentHash, testNow + 900, testNow + 900},
-		{"staked waits for the next rotation", currRound, StateStaked, currentHash, 0, nextRound},
-		{"validating waits for the next rotation", currRound, StateValidating, currentHash, 0, nextRound},
+		{"open waits for the election window", nextRound, StateOpen, currentHash, 0, testNow, electionAt},
+		{"held waits for stake_held_until", prevRound, StateHeld, currentHash, testNow + 900, testNow, testNow + 900},
+		{"staked waits for the next rotation", currRound, StateStaked, currentHash, 0, afterWindow, nextRound},
+		{"validating waits for the next rotation", currRound, StateValidating, currentHash, 0, afterWindow, nextRound},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			v := trustedView(t, tt.round, tt.state, tt.hash, tt.until, false, electionAt, testNow)
+			v := trustedView(t, tt.round, tt.state, tt.hash, tt.until, false, electionAt, tt.now)
 			got, ok := NextDeadline(v)
 			if !ok || got != tt.want {
 				t.Fatalf("got %v (ok=%v), want %v", got, ok, tt.want)
@@ -245,7 +251,7 @@ func TestNextDeadline(t *testing.T) {
 
 	// A round that is already due must not contribute a future deadline, or the loop would sleep
 	// past the poke it should be sending right now.
-	rotated := trustedView(t, currRound, StateStaked, staleHash, 0, false, electionAt, testNow)
+	rotated := trustedView(t, currRound, StateStaked, staleHash, 0, false, electionAt, afterWindow)
 	if d, ok := NextDeadline(rotated); ok {
 		t.Fatalf("an already-due round produced a future deadline of %v", d)
 	}
@@ -302,5 +308,136 @@ func TestRotationIsWatchedPastItsDeadline(t *testing.T) {
 	}
 	if d, ok := NextDeadline(rotated); ok {
 		t.Fatalf("a due poke also produced a deadline of %v", d)
+	}
+}
+
+// TestTheElectionWindowIsADeadlineBeforeAnyoneBids. A participation exists only once the first
+// request_loan arrives, and every other deadline is read off a participation - so with nobody
+// having bid, the window's opening was invisible and the loop slept through it.
+//
+// 2026-10-07, round 1791381256: both borrower hosts broadcast their sealed bid one second before
+// the window, the first request landed at 11:22:43, the window opened at 11:22:44, and this service
+// - last awake at 11:20:15 with nothing to aim at - woke at 11:25:15 to find the round already
+// staked by a poke sent from somewhere else at 11:24:42.
+func TestTheElectionWindowIsADeadlineBeforeAnyoneBids(t *testing.T) {
+	// The steady state between rounds: one round validating, nothing on the books for the next.
+	noBidsYet := func(now uint32) View {
+		return trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, now)
+	}
+
+	got, ok := NextDeadline(noBidsYet(testNow))
+	if !ok || got != electionAt {
+		t.Fatalf("with no round for the next election the deadline is %v (ok=%v), want the window opening at %v",
+			got, ok, electionAt)
+	}
+
+	// The reading from the day: 149 seconds before the window. It slept five minutes.
+	v := noBidsYet(electionAt - 149)
+	d, _ := NextDeadline(v)
+	wait, reason := NextWait(false, time.Duration(int64(d)-int64(v.Now))*time.Second, true)
+	if wait != 149*time.Second-BurstLead {
+		t.Fatalf("149s before the window the loop sleeps %v (%v); it has to wake at the lead, not sleep through", wait, reason)
+	}
+}
+
+// From the lead until the grace runs out the loop has to be reading every tick, because a round
+// created a second before the window is not visible to a read until a masterchain block has
+// referenced the shard block it landed in.
+func TestTheWindowOpeningIsWatchedUntilTheRoundAppears(t *testing.T) {
+	for _, offset := range []int64{-2, -1, 0, 1, 5, 15, int64(participateGraceSeconds) - 1} {
+		now := uint32(int64(electionAt) + offset)
+		v := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, now)
+		d, ok := NextDeadline(v)
+		if !ok || d != electionAt {
+			t.Fatalf("at window%+d the deadline is %v (ok=%v), want the opening still held at %v", offset, d, ok, electionAt)
+		}
+		if wait, _ := NextWait(false, time.Duration(int64(d)-int64(now))*time.Second, true); wait != BurstTick {
+			t.Fatalf("at window%+d the loop waits %v, not a tick; a round created at the last second is found late", offset, wait)
+		}
+	}
+}
+
+// Past the grace the tick cadence has to stop - a round nobody bids on must not be read every
+// second for ten minutes - but a late bid should still wait a minute, not MaxSleep.
+func TestTheRestOfTheWindowIsPolledAtTheRetryInterval(t *testing.T) {
+	for _, offset := range []uint32{participateGraceSeconds, participateGraceSeconds + 60, 599} {
+		now := electionAt + offset
+		v := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, now)
+		d, ok := NextDeadline(v)
+		if !ok {
+			t.Fatalf("%vs into the window there is no deadline at all; the loop sleeps MaxSleep", offset)
+		}
+		wait, _ := NextWait(false, time.Duration(int64(d)-int64(now))*time.Second, true)
+		if wait <= BurstTick {
+			t.Fatalf("%vs into the window the loop is still reading every tick", offset)
+		}
+		if wait > RetryInterval {
+			t.Fatalf("%vs into the window the loop sleeps %v; a late bid would wait that long", offset, wait)
+		}
+	}
+
+	// Once the window has closed there is nothing to watch for, and the rotation is next.
+	closed := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, electionAt+600)
+	if d, ok := NextDeadline(closed); !ok || d != nextRound {
+		t.Fatalf("after the window closed the deadline is %v (ok=%v), want the rotation at %v", d, ok, nextRound)
+	}
+}
+
+// The watch is for a round that is NOT on the books. Once it is there, in any state, its own
+// state speaks for it - and a halted treasury accepts no request, so no round can open at all.
+func TestTheWindowIsNotWatchedWhenThereIsNothingToWaitFor(t *testing.T) {
+	inWindow := electionAt + 5
+
+	// Someone has already bid and the round has already been driven on.
+	for _, state := range []State{StateDistributing, StateStaked} {
+		v := trustedView(t, nextRound, state, currentHash, 0, false, electionAt, inWindow)
+		if d, ok := NextDeadline(v); ok && d == electionAt {
+			t.Fatalf("a round already %v was still being watched for at the window opening", state)
+		}
+	}
+
+	// request_loan throws err::stopped, so nothing can open.
+	halted := trustedView(t, currRound, StateValidating, currentHash, 0, true, electionAt, electionAt-10)
+	if d, ok := NextDeadline(halted); ok && d == electionAt {
+		t.Fatal("a halted treasury, which accepts no loan request, was watched for a round opening")
+	}
+
+	// Blind mode knows nothing about rounds or times.
+	blind := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, electionAt-10)
+	blind.Blind = true
+	if _, ok := NextDeadline(blind); ok {
+		t.Fatal("blind mode produced a deadline")
+	}
+
+	// And times that make no sense are not acted on.
+	broken := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, electionAt-10)
+	broken.Treasury.Times.ParticipateUntil = broken.Treasury.Times.ParticipateSince
+	if d, ok := NextDeadline(broken); ok && d == electionAt {
+		t.Fatal("a window that closes when it opens was watched")
+	}
+}
+
+// And the point of all of it: once a read does see the round, the poke is due at once.
+func TestARoundThatAppearsInsideTheWindowIsPokedAtOnce(t *testing.T) {
+	appeared := trustedView(t, nextRound, StateOpen, currentHash, 0, false, electionAt, electionAt+4)
+	if got := Due(appeared, time.Now()); !sameOps(got, []Op{OpParticipateInElection}) {
+		t.Fatalf("a round that opened four seconds into the window is due %v, want participate_in_election", ops(got))
+	}
+}
+
+// The same thing through schedule, which is what Cycle calls: the deadline has to survive the trip
+// through the clock, or the pieces above are each right and the loop still sleeps five minutes.
+func TestScheduleWakesForAWindowWithNoRound(t *testing.T) {
+	p := &Poker{clock: &Clock{}, tracker: NewTracker()}
+	now := electionAt - 10
+	p.clock.Observe(now)
+
+	v := trustedView(t, currRound, StateValidating, currentHash, 0, false, electionAt, now)
+	wait, reason := p.schedule(v, false)
+	if wait > 10*time.Second {
+		t.Fatalf("ten seconds before a window nobody has bid in yet, the loop sleeps %v (%v)", wait, reason)
+	}
+	if wait < BurstTick {
+		t.Fatalf("the loop would spin: %v", wait)
 	}
 }
