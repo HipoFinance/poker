@@ -127,8 +127,16 @@ changing the message encoding, disabling the participation consumption check, or
 clock correction each fail a named test. If a change makes a test pass that should not, that is
 the bug.
 
-## After you push: bump the pin in `operation`
+## After you push: move the pin in `operation`
 
-A push to `main` builds one image tagged `sha-<short commit>` (`.github/workflows/build.yml`).
-The deployment lives in [`HipoFinance/operation`](https://github.com/HipoFinance/operation), which
-pins that tag in `stack/poker.yaml`. Run `./bump.sh poker` there after the build finishes.
+A push to `main` here builds one image, tagged `sha-<short commit>`
+(`.github/workflows/build.yml`). The deployment lives in
+[`HipoFinance/operation`](https://github.com/HipoFinance/operation), which pins that tag in
+`stack/poker.yaml`.
+
+**Publishing an image changes nothing on the servers.** Moving the pin is a second step, and a
+person deploys after it. The procedure is the `team:release` skill of the team plugin
+(`/team:release`). In a session without the plugin, read the same text at
+<https://github.com/HipoFinance/claude-team/blob/main/plugins/team/skills/release/SKILL.md>
+(`gh api repos/HipoFinance/claude-team/contents/plugins/team/skills/release/SKILL.md -H "Accept: application/vnd.github.raw"`)
+and follow it.
