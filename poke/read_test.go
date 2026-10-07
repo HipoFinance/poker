@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
+
+	"github.com/xssnick/tonutils-go/ton"
 )
 
 // The 2026-09-20 failure, verbatim in shape: our own node answered CurrentMasterchainInfo with a
@@ -143,5 +146,137 @@ func TestSummariseIsStable(t *testing.T) {
 		if got := summarise(counts); got != want {
 			t.Fatalf("summarise is %q, want %q", got, want)
 		}
+	}
+}
+
+// What mainnet actually sent on 2026-10-06 at 19:42, when both vset_changed pokes had already been
+// accepted and the burst was re-sending: our own nodes refused at once, and the public pool hung
+// until its timeout.
+var (
+	ownRefusal    = lsRefusal(refusedVset) // -701, exitcode=206
+	publicTimeout = errors.New("context deadline exceeded")
+	unlabelled    = ton.LSError{Code: 0, Text: refusedWithoutACode}
+)
+
+// TestARefusalOutranksATimeout is the bug. chooseFailure returned the last error to arrive unless
+// one was a duplicate, and the last to arrive is by construction the slowest endpoint - so a
+// timeout overwrote a real refusal, and an ordinary "already done" was logged as "Failed to send",
+// counted as a transport error, and dropped from the burst. Fourteen and seventeen times in
+// eleven days.
+func TestARefusalOutranksATimeout(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		failures []error
+		want     error
+	}{
+		{"the refusal arrived first, as it did on the day", []error{ownRefusal, publicTimeout}, ownRefusal},
+		{"the refusal arrived last", []error{publicTimeout, ownRefusal}, ownRefusal},
+		{"a refusal with no exit code still outranks a timeout", []error{unlabelled, publicTimeout}, unlabelled},
+		{"a labelled refusal outranks an unlabelled one", []error{unlabelled, ownRefusal}, ownRefusal},
+		{"a duplicate still comes first", []error{ownRefusal, duplicateErr(), publicTimeout}, duplicateErr()},
+		{"with no verdict at all it is a transport error", []error{errors.New("first"), publicTimeout}, publicTimeout},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := chooseFailure(tt.failures); got != tt.want {
+				t.Fatalf("chose %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// And what the caller then does with it: a refusal must be read as one, or the fix stops at
+	// the function boundary.
+	chosen := chooseFailure([]error{ownRefusal, publicTimeout})
+	if r, ok := asRejection(chosen); !ok || r.Code != 206 {
+		t.Fatalf("the chosen failure is not read as the 206 refusal it is: %v", chosen)
+	}
+}
+
+// feed returns a results channel that delivers each answer after its delay, the way endpoints do.
+func feed(answers map[time.Duration]error) (<-chan error, int) {
+	ch := make(chan error, len(answers))
+	for after, err := range answers {
+		go func(after time.Duration, err error) {
+			time.Sleep(after)
+			ch <- err
+		}(after, err)
+	}
+	return ch, len(answers)
+}
+
+// TestSendDoesNotWaitOutAHungEndpoint. The other half: with the refusal preferred but still
+// waited for, every send in the burst took the hung endpoint's full five seconds, and the burst
+// made 5 attempts in 13 seconds where it should have made about 20.
+func TestSendDoesNotWaitOutAHungEndpoint(t *testing.T) {
+	t.Parallel()
+	const grace = 100 * time.Millisecond
+	hang := 2 * time.Second // stands in for sendTimeout
+
+	results, n := feed(map[time.Duration]error{
+		10 * time.Millisecond: ownRefusal,
+		hang:                  publicTimeout,
+	})
+	start := time.Now()
+	got := collect(results, n, grace)
+	elapsed := time.Since(start)
+
+	if got != ownRefusal {
+		t.Fatalf("reported %v, want the refusal that had already arrived", got)
+	}
+	if elapsed > hang/2 {
+		t.Fatalf("waited %v for an endpoint that never answered; the burst stalls on every send", elapsed)
+	}
+	if elapsed < grace {
+		t.Fatalf("returned after %v, before the %v grace: a node a block ahead gets no chance to accept", elapsed, grace)
+	}
+}
+
+// The grace exists for this: a node that refuses may be a block behind one that would accept, so
+// an acceptance arriving inside it still wins.
+func TestAnAcceptanceInsideTheGraceStillWins(t *testing.T) {
+	t.Parallel()
+	results, n := feed(map[time.Duration]error{
+		10 * time.Millisecond: ownRefusal,
+		60 * time.Millisecond: nil,
+	})
+	if got := collect(results, n, 500*time.Millisecond); got != nil {
+		t.Fatalf("a refusal from a lagging node hid an acceptance from another: %v", got)
+	}
+}
+
+// With no verdict from any node, nothing may be reported early: the only honest answer is that
+// nothing reached the chain, and that needs every endpoint to have failed.
+func TestWithNoVerdictSendWaitsForEveryEndpoint(t *testing.T) {
+	t.Parallel()
+	slow := 300 * time.Millisecond
+	results, n := feed(map[time.Duration]error{
+		10 * time.Millisecond: errors.New("dial tcp: connection refused"),
+		slow:                  publicTimeout,
+	})
+	start := time.Now()
+	got := collect(results, n, 50*time.Millisecond)
+	if elapsed := time.Since(start); elapsed < slow {
+		t.Fatalf("gave up after %v with one endpoint still unheard and no verdict from any", elapsed)
+	}
+	if _, ok := asRejection(got); ok || isDuplicate(got) {
+		t.Fatalf("a transport failure was reported as a verdict: %v", got)
+	}
+	if got == nil {
+		t.Fatal("a send no endpoint took was reported as sent")
+	}
+}
+
+// And an acceptance still returns at once, without waiting for anybody.
+func TestAnAcceptanceReturnsImmediately(t *testing.T) {
+	t.Parallel()
+	results, n := feed(map[time.Duration]error{
+		10 * time.Millisecond: nil,
+		2 * time.Second:       publicTimeout,
+	})
+	start := time.Now()
+	if got := collect(results, n, time.Second); got != nil {
+		t.Fatalf("an accepted send was reported as %v", got)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("an accepted send waited %v for a slower endpoint", elapsed)
 	}
 }

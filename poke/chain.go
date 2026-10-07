@@ -331,38 +331,105 @@ func (c *Chain) Send(ctx context.Context, body *cell.Cell) error {
 		}(ep)
 	}
 
-	// Read as they arrive and return on the first success rather than waiting for all of them.
-	// Waiting made every send take the SLOWEST endpoint's time, so one black-holed endpoint still
-	// added its whole timeout to every poke in a cycle - which is the problem making these
-	// concurrent was supposed to solve, and making them concurrent alone did not. The channel is
-	// buffered to the number of endpoints, so stragglers finish into it and nothing leaks.
-	failures := make([]error, 0, len(c.endpoints))
-	for range c.endpoints {
-		err := <-results
-		if err == nil {
-			return nil
+	return collect(results, len(c.endpoints), answerGrace)
+}
+
+// answerGrace is how long Send goes on waiting for the remaining endpoints once one of them has
+// given a real answer that was not an acceptance - a refusal, or a duplicate.
+//
+// It is worth waiting a little: a node that refuses may simply be a block behind one that would
+// accept, which is why a refusal does not end the send outright. It is not worth waiting the whole
+// sendTimeout, because inside a burst that is five ticks. On 2026-10-06 our two nodes answered a
+// rotation's re-sends with 206 at once while the public pool hung, and every send sat out its full
+// five seconds: the burst made 5 attempts in 13 seconds where it should have made about 20. One
+// tick is the natural bound - a second opinion that takes longer than the next attempt would is
+// not worth more than that attempt.
+const answerGrace = BurstTick
+
+// collect reads the endpoints' answers as they arrive and decides when Send has heard enough.
+//
+// An acceptance ends it at once. Waiting for the rest made every send take the SLOWEST endpoint's
+// time, so one black-holed endpoint added its whole timeout to every poke in a cycle. That was
+// fixed for the accepting case first and left in place for the refusing one, which is the common
+// case in a burst: everything after the transition lands is a refusal. Now a real answer of any
+// kind starts a short grace instead, and whatever has arrived by its end is what gets reported.
+//
+// With no real answer at all - every endpoint erroring or timing out - it still waits for all of
+// them, because then the only honest report is that nothing reached the chain.
+//
+// The channel is buffered to the number of endpoints, so an endpoint that answers after collect
+// has returned finishes into it and nothing leaks.
+func collect(results <-chan error, n int, grace time.Duration) error {
+	failures := make([]error, 0, n)
+	var graceOver <-chan time.Time // nil until a real answer arrives; a nil channel never fires
+	for len(failures) < n {
+		select {
+		case err := <-results:
+			if err == nil {
+				return nil
+			}
+			failures = append(failures, err)
+			if graceOver == nil && answered(err) {
+				graceOver = time.After(grace)
+			}
+		case <-graceOver:
+			return chooseFailure(failures)
 		}
-		failures = append(failures, err)
 	}
 	return chooseFailure(failures)
 }
 
+// answered reports whether an error is a node's own verdict on the message - it ran it and the
+// treasury refused, or it already holds a copy - as opposed to a failure to get an answer at all.
+func answered(err error) bool {
+	if isDuplicate(err) {
+		return true
+	}
+	_, ok := asRejection(err)
+	return ok
+}
+
 // chooseFailure picks which failure to report when no endpoint accepted the message outright.
+// The rule is that a node's verdict always outranks a failure to hear from another node.
 //
-// A duplicate wins over anything else. It is the most informative answer available - the message
-// is already queued at a node, so the poke has in fact left - and without this preference one slow
-// endpoint's timeout, arriving later on the channel, overwrites it and the caller counts a
-// delivered poke as a failure to send. That miscount switches off the one-second burst, which is
-// how a poke that was one second early came to wait a full minute for its retry.
+// A duplicate comes first. The message is already queued at a node, so the poke has in fact left.
+//
+// A refusal comes next, and this is the half that was missing. Like a duplicate it means the
+// message reached a node and was run, which is everything "sent" means here. Without it the last
+// error to arrive won, and the last to arrive is by construction the slowest: on 2026-10-06 both
+// vset_changed pokes had been accepted, our own nodes were correctly answering 206 to the burst's
+// re-sends, and the public pool's five-second timeout overwrote them. An ordinary "already done"
+// was logged as "Failed to send ... context deadline exceeded", counted in
+// hipo_poker_poke_errors_total, and - because a transport failure settles - dropped from the
+// burst. Fourteen and seventeen times in eleven days, on the two instances.
+//
+// Among refusals, one that names its exit code beats one that does not: the unlabelled shape
+// cannot settle a burst or say which guard threw.
+//
+// Only when no node answered at all is a transport error reported, and then it is the last one.
 func chooseFailure(failures []error) error {
-	var lastErr error
+	var labelled, unlabelled, transport error
 	for _, err := range failures {
 		if isDuplicate(err) {
 			return err
 		}
-		lastErr = err
+		if r, ok := asRejection(err); ok {
+			if r.Code != 0 && labelled == nil {
+				labelled = err
+			} else if r.Code == 0 && unlabelled == nil {
+				unlabelled = err
+			}
+			continue
+		}
+		transport = err
 	}
-	return lastErr
+	switch {
+	case labelled != nil:
+		return labelled
+	case unlabelled != nil:
+		return unlabelled
+	}
+	return transport
 }
 
 // LiteServer is one own-node liteserver, as `host:port` plus its base64 public key.
