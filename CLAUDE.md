@@ -68,6 +68,14 @@ the wait: once any node has answered, `collect` gives the others one tick (`answ
 whole `sendTimeout`, or one hung endpoint costs every send in a burst five seconds. With no verdict
 at all it still waits for everyone, because then "nothing left" is the only honest report.
 
+**A read can be behind the chain, and a refusal can say so.** A read pins the last masterchain
+block; a send is run against the node's newest shard state, and the treasury is on basechain. So a
+cycle can read a round as due, send, and be told the round has already moved past that op
+(`MovedPast`: 202, 204, 207, 7). `rereadIfStale` then reads again at the tick instead of treating
+the poke as outstanding for a minute. It is bounded at `maxStaleRereads` in a row, because an
+endpoint with stuck reads and live sends would otherwise loop at one second forever, and it is off
+in blind mode, where `round_not_found` is just a wrong guess.
+
 **`Expected` and `Settled` are different questions over the same codes, and they disagree.**
 `Expected` decides whether to warn a human; `Settled` decides whether the burst stops re-sending,
 which matters because the burst reads nothing between attempts and has only the exit code to go

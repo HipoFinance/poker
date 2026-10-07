@@ -154,6 +154,27 @@ func (r Rejection) Settled() bool {
 	return true
 }
 
+// MovedPast reports whether this refusal says the round has already gone beyond the state this op
+// applies to - which, in a cycle that just read the round as still due, means the read is behind
+// the chain.
+//
+// It is a third question over the same codes, narrower than Settled. 202, 204 and 207 are each a
+// state check failing - no longer open, no longer held, neither staked nor validating - and 7 is
+// the round having been deleted altogether, which is where a finished round ends up. An
+// unrecognised code settles a burst but says nothing about which way the state went, 206 is
+// ambiguous, and the too-soon codes mean the opposite.
+//
+// That it can happen at all is structural: a read pins the last MASTERCHAIN block, a send is run
+// against the node's newest SHARD state, and the treasury lives on basechain, so a read can trail
+// a send by a block or so. See rereadIfStale in run.go for what is done about it.
+func (r Rejection) MovedPast() bool {
+	switch r.Code {
+	case 202, 204, 207, exitTypeCheck:
+		return true
+	}
+	return false
+}
+
 // asRejection reports whether an error is the treasury refusing the message rather than a failure
 // to reach the chain at all. The distinction decides three things: whether it is logged as a
 // warning, whether it counts as a send failure, and whether the poke counts as having left - a

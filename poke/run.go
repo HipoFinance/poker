@@ -44,6 +44,12 @@ type Poker struct {
 	lastView   string
 	lastWait   string
 	lastLogged time.Time
+
+	// movedPast is set by attempt when a send is refused because the round has already gone
+	// beyond the state the op applies to, and cleared at the top of each cycle's sends.
+	// staleRereads counts consecutive cycles that re-read early for that reason. See rereadIfStale.
+	movedPast    bool
+	staleRereads int
 }
 
 // logHeartbeat is how often an unchanged picture is repeated anyway, so that a quiet log is
@@ -258,6 +264,7 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	}}
 
 	burstWanted := p.shouldBurstBefore(view, due)
+	p.movedPast = false
 	sent, unsettled := p.attempt(ctx, due, report)
 	if len(routine) > 0 {
 		log.Printf("🙈 Blind cycle: %v", summarise(routine))
@@ -293,7 +300,51 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 		// is that read, and it is worth having at once rather than a minute later.
 		return BurstTick, "confirming the burst"
 	}
+	if wait, reason, ok := p.rereadIfStale(view.Blind); ok {
+		return wait, reason
+	}
 	return p.schedule(view, len(due) > 0)
+}
+
+// maxStaleRereads bounds how many cycles in a row may re-read at the tick because a send was told
+// the round had moved past it. A read trails the chain by a block or so, which is a few seconds;
+// five ticks is comfortably more than that and still short of a loop.
+const maxStaleRereads = 5
+
+// rereadIfStale turns "the treasury says this round has moved on" into "so read again now".
+//
+// A cycle reads the round as due, sends, and is refused with a code that means the state is
+// already past this op. The round has moved; the read was behind. Nothing is wrong on chain, but
+// the cycle then scheduled itself as if a poke were merely outstanding and came back in a minute:
+//
+//	07:20:42 🔁 Burst: not_ready_to_finish_participation (204) ×1, sent ×1
+//	07:20:43 ↩️  finish_participation(1790136072) refused: round_not_found (7)
+//	07:20:43 💤 Next cycle in 1m0s (retry)
+//	07:21:44 ✅ finish_participation(1790136072) confirmed: the state moved
+//
+// That minute changed nothing the protocol did - the other instance had confirmed the same round
+// forty seconds earlier - but it left a poke that was finished looking outstanding for a minute,
+// in the log and in hipo_poker_unconfirmed_poke_seconds. Reading again at the tick confirms it in
+// a second or two instead.
+//
+// Bounded, because the opposite failure is worse than the one being fixed: an endpoint whose reads
+// are stuck on an old block while sends reach a live one (PokerReadBlockStale's case) would answer
+// "due" and "moved past" on every cycle forever, and without a bound this would be a one-second
+// loop of six round trips and a send. After maxStaleRereads in a row it falls back to the ordinary
+// schedule, and only a cycle with no such refusal re-arms it.
+//
+// Never in blind mode: there round_not_found is the ordinary answer to a guessed round, and says
+// nothing about a read, because there was none.
+func (p *Poker) rereadIfStale(blind bool) (time.Duration, string, bool) {
+	if blind || !p.movedPast {
+		p.staleRereads = 0
+		return 0, "", false
+	}
+	if p.staleRereads >= maxStaleRereads {
+		return 0, "", false
+	}
+	p.staleRereads++
+	return BurstTick, "the chain is ahead of this read", true
 }
 
 // reporter decides how one round of attempts speaks.
@@ -359,6 +410,9 @@ func (p *Poker) attempt(ctx context.Context, due []Poke, r reporter) (sent, unse
 			}
 			PokesRejected.WithLabelValues(poke.Op.String(), strconv.Itoa(reject.Code)).Inc()
 			sent = append(sent, poke)
+			if reject.MovedPast() {
+				p.movedPast = true
+			}
 			if !reject.Settled() {
 				unsettled = append(unsettled, poke)
 			}
