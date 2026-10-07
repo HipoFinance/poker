@@ -76,6 +76,13 @@ The second is treated as ordinary and keeps its poke in the burst: the cause is 
 reports less, not a contract doing something new, and with no code there is nothing to conclude
 from.
 
+One rule decides what a send reports when no endpoint accepts it: **a node's verdict outranks a
+failure to hear from another node.** A refusal or a duplicate means the message reached a node and
+was run; a timeout means an endpoint said nothing, and the last error to arrive is always the
+slowest endpoint's. So a refusal is reported even when another endpoint hangs, and once any node
+has answered, the rest get one tick to answer too rather than the full five-second timeout — a
+node a block ahead can still accept, but a hung endpoint cannot stall the burst.
+
 Two more answers look like failures and are not. Exit code **7** is TVM's type check error and for
 these three handlers it has one cause: all of them `udict_get` the participation and hand a miss
 straight to `unpack_participation`, so 7 means *the treasury has no such round*. Blind mode

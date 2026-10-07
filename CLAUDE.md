@@ -58,6 +58,16 @@ transport failure warns, only a real transport failure counts in
 every round), and a refused poke still counts as **sent**, so the burst keeps its cadence and the
 tracker keeps ageing it.
 
+**A node's verdict outranks a failure to hear from another node.** `Send` fans out to every
+endpoint, and when none accepts, `chooseFailure` has to pick what to report. A duplicate or a
+refusal is a node saying it has the message and ran it; a timeout is an endpoint saying nothing.
+Reporting the last error to arrive reports the slowest endpoint, so a hung public pool turned an
+ordinary `206` into `Failed to send ... context deadline exceeded` — warned, counted as an error,
+dropped from the burst — 14 and 17 times in eleven days before 2026-10-07. The same reasoning bounds
+the wait: once any node has answered, `collect` gives the others one tick (`answerGrace`), not the
+whole `sendTimeout`, or one hung endpoint costs every send in a burst five seconds. With no verdict
+at all it still waits for everyone, because then "nothing left" is the only honest report.
+
 **`Expected` and `Settled` are different questions over the same codes, and they disagree.**
 `Expected` decides whether to warn a human; `Settled` decides whether the burst stops re-sending,
 which matters because the burst reads nothing between attempts and has only the exit code to go
