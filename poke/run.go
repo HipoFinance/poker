@@ -264,8 +264,7 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	}}
 
 	burstWanted := p.shouldBurstBefore(view, due)
-	p.movedPast = false
-	sent, unsettled := p.attempt(ctx, due, report)
+	sent, unsettled := p.firstAttempt(ctx, due, report)
 	if len(routine) > 0 {
 		log.Printf("🙈 Blind cycle: %v", summarise(routine))
 	}
@@ -295,6 +294,20 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 		PublishOutstanding(nil)
 	}
 
+	return p.nextWait(view, len(due) > 0, bursted)
+}
+
+// firstAttempt is a cycle's own send of the due set, as opposed to a burst's re-sends. It clears
+// the stale-read mark first, so that the mark only ever describes the cycle that is running: left
+// set, one moved-past refusal would have every later cycle reading early until the bound ran out,
+// and then never again.
+func (p *Poker) firstAttempt(ctx context.Context, due []Poke, r reporter) (sent, unsettled []Poke) {
+	p.movedPast = false
+	return p.attempt(ctx, due, r)
+}
+
+// nextWait decides how long to sleep once a cycle's sends are done. Three cases, soonest first.
+func (p *Poker) nextWait(view View, pending, bursted bool) (time.Duration, string) {
 	if bursted {
 		// A burst sends without reading, so nothing it did has been confirmed yet. The next cycle
 		// is that read, and it is worth having at once rather than a minute later.
@@ -303,7 +316,7 @@ func (p *Poker) Cycle(ctx context.Context) (time.Duration, string) {
 	if wait, reason, ok := p.rereadIfStale(view.Blind); ok {
 		return wait, reason
 	}
-	return p.schedule(view, len(due) > 0)
+	return p.schedule(view, pending)
 }
 
 // maxStaleRereads bounds how many cycles in a row may re-read at the tick because a send was told
