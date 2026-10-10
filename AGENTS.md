@@ -159,5 +159,9 @@ size, run this before you report**, without being asked:
 It only reads files, and it needs a clone of the run-book repo beside this one. For each page it
 lists, read the page against your change. Your report says which pages depend on the changed
 files and whether each needs an edit, or that the command listed none. If you could not run it,
-say so. Editing a page follows the `team:runbook` skill; a page shown as marked needs its owner's
-review and a money review before it changes.
+say so. Editing a page follows the `team:runbook` skill of the team plugin (`/team:runbook`); a
+page shown as marked needs its owner's review and a money review before it changes. In a session
+without the plugin, read the same text at
+<https://github.com/HipoFinance/claude-team/blob/main/plugins/team/skills/runbook/SKILL.md>
+(`gh api repos/HipoFinance/claude-team/contents/plugins/team/skills/runbook/SKILL.md -H "Accept: application/vnd.github.raw"`)
+and follow it.
