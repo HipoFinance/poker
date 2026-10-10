@@ -145,3 +145,19 @@ other round. `TestScheduleUsesTheNewestSend` pins it at the wiring, because a un
 
 **Timing is on the chain's clock.** Never schedule against `time.Now()` directly; go through
 `Clock`.
+
+## When you change X, also update Y
+
+### Run-book pages
+
+Run-book pages in `HipoFinance/runbook` tell a person what to do when an alert or a bot message
+arrives, and they depend on code here. **After every change to code in this repo, whatever its
+size, run this before you report**, without being asked:
+
+    python3 ../runbook/checks/sync.py --touched .
+
+It only reads files, and it needs a clone of the run-book repo beside this one. For each page it
+lists, read the page against your change. Your report says which pages depend on the changed
+files and whether each needs an edit, or that the command listed none. If you could not run it,
+say so. Editing a page follows the `team:runbook` skill; a page shown as marked needs its owner's
+review and a money review before it changes.
